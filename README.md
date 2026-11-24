@@ -1,69 +1,68 @@
 # Macleaner
 
-Utilitário nativo e leve para a barra de menus do macOS (menu bar only) focado em diagnosticar e limpar com segurança **Dados do Sistema** (*System Data*), caches pesados de desenvolvimento e pastas temporárias de aplicativos.
+A lightweight, native macOS menu bar utility to inspect and safely reclaim **System Data**, developer caches, and bloated application directories without permanently deleting files.
 
-Construído com **Tauri v2**, **Rust** (`jwalk`, `rayon`, `trash`, `window-vibrancy`) e **TypeScript + Vite** sem frameworks pesados.
-
----
-
-## Principais Recursos
-
-- **Nativo na barra superior do macOS:** roda com `ActivationPolicy::Accessory` (sem ícone no Dock), janela popover sem bordas (`380x480px`) com blur translúcido real via `NSVisualEffectMaterial::Popover` (`window-vibrancy`), suporte automático a **Light / Dark Mode** e fechamento ao perder foco.
-- **Interface enxuta em 3 abas:**
-  - **Resumo:** saúde real do volume (`Macintosh HD`), barra proporcional entre espaço em uso e espaço mapeado, scan em paralelo com progresso em tempo real e acesso rápido aos maiores ocupantes.
-  - **Itens:** pastas ordenadas por tamanho com filtro por risco (`Baixo`, `Médio`, `Alto`), chips das principais extensões, explicação objetiva e visualização expansível de **subpastas reais** (ex.: separando `steamapps/common` de `steamapps/shadercache` e `appcache`).
-  - **Ajustes:** seletor de idioma (**Português**, **English**, **Español**), tamanho mínimo de pasta (MB) e motor de IA (Ollama local ou API HTTPS compatível com OpenAI).
-- **Varredura rápida e segura:**
-  - Travessia paralela com `jwalk` + `rayon` em `~/Library/Caches`, `~/Library/Application Support`, `~/Library/Developer`, `~/.cache` e caches diretos (`.cargo/registry`, `.npm`, `.ollama/models`, `Library/pnpm/store`, `Library/Logs`).
-  - Classificação instantânea via regras embutidas (`src-tauri/rules/known.toml`).
-  - Bloqueio preventivo de caminhos protegidos pelo **SIP** e **TCC** do macOS, ignorando erros `PermissionDenied` silenciosamente.
-- **Remoção 100% reversível:** nunca usa `rm -rf` ou `remove_dir_all`. Todo item ou subpasta é enviado exclusivamente para a **Lixeira nativa do macOS** via crate `trash`.
-- **IA híbrida executada apenas no scan:** analisa somente pastas sem regra conhecida usando evidências reais (subpastas, tamanhos, contagem de arquivos, idade e extensões), com `think: false` e descarregamento imediato da RAM (`keep_alive: 0`) no Ollama ao final do scan, ou fallback conservador quando offline.
-- **Verificação de atualizações:** botão **Update** no cabeçalho consulta as *Releases* do repositório no GitHub comparando a versão semântica instalada (`v0.1.0`) com versões futuras.
+Built with **Tauri v2**, **Rust** (`jwalk`, `rayon`, `trash`, `window-vibrancy`), and **TypeScript + Vite**.
 
 ---
 
-## Requisitos para Rodar e Compilar
+## Features
 
-### Para usuários (executando o `.app` / `.dmg`)
-- **macOS 12+** (Apple Silicon `aarch64` ou Intel `x86_64`; efeito visual aprimorado em versões recentes com `NSVisualEffectMaterial::Popover`).
-- *(Opcional)* **Ollama** instalado e em execução em `http://127.0.0.1:11434` com pelo menos um modelo local (ex.: `ollama pull qwen3:8b` ou `llama3.2:3b`), ou uma chave de API HTTPS compatível com OpenAI caso queira análise por IA de pastas desconhecidas. Sem IA configurada, o app opera normalmente com regras locais e classificação conservadora.
-
-### Para desenvolvimento / compilação a partir do código-fonte
-1. **macOS** com **Xcode Command Line Tools**:
-   ```bash
-   xcode-select --install
-   ```
-2. **Rust** (`1.90+`, testado em `1.100.0`) via [rustup](https://rustup.rs/):
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-3. **Node.js** (`20+`) e `npm`.
+- **Native macOS Menu Bar Popover:** Runs as an accessory app (`ActivationPolicy::Accessory`, no Dock icon) with native `NSVisualEffectMaterial::Popover` vibrancy, automatic Light/Dark mode support, and auto-dismiss on focus loss.
+- **Three-Tab Workflow:**
+  - **Summary:** Live disk health telemetry, proportional storage bar, parallel scan progress, and quick access to the largest folders.
+  - **Items:** Directories sorted by size with risk filters (`Low`, `Medium`, `High`), top file extensions, concise explanations, and expandable **subfolder inspection** (e.g., separating `steamapps/common` from `steamapps/shadercache` and `appcache`).
+  - **Settings:** Runtime language switcher (**Português**, **English**, **Español**), minimum folder size threshold (MB), and AI engine configuration.
+- **Fast & Safe Scanning:**
+  - Parallel traversal with `jwalk` and `rayon` across `~/Library/Caches`, `~/Library/Application Support`, `~/Library/Developer`, `~/.cache`, and common developer targets (`.cargo/registry`, `.npm`, `.ollama/models`, `Library/pnpm/store`, `Library/Logs`).
+  - Instant deterministic classification via embedded rules (`src-tauri/rules/known.toml`).
+  - Proactive **SIP** and **TCC** path filtering; `PermissionDenied` errors are handled silently.
+- **Reversible Removal:** Never uses `rm -rf` or `remove_dir_all`. Every selected folder or subfolder is moved to the **macOS Trash** using the `trash` crate so files can always be restored.
+- **On-Scan Hybrid AI:** Runs strictly during a scan for unmapped folders using real subfolder and extension telemetry—supporting local **Ollama** (auto-detecting installed models, disabling reasoning overhead with `think: false`, and unloading from RAM via `keep_alive: 0`) or an optional HTTPS OpenAI-compatible API, with a conservative fallback when offline.
+- **Update Check:** Header **Update** button checks GitHub Releases against the installed version (`v0.1.0`) and alerts when a newer release is published.
 
 ---
 
-## Como Executar
+## Requirements
 
-### 1. Instalar dependências
+### Running the App
+- **macOS 12+** (Apple Silicon `aarch64` builds provided in Releases; Intel `x86_64` supported when built from source).
+- *(Optional)* **Ollama** running locally on `http://127.0.0.1:11434` with any pulled model (e.g., `ollama pull qwen3:8b` or `llama3.2:3b`), or an HTTPS OpenAI-compatible API key. Without an AI provider, Macleaner operates with local deterministic rules and conservative classification.
+
+### Building from Source
+- **macOS** with **Xcode Command Line Tools**:
+  ```bash
+  xcode-select --install
+  ```
+- **Rust** (`1.90+`) via [rustup](https://rustup.rs/):
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+- **Node.js** (`20+`) and `npm`.
+
+---
+
+## Getting Started
+
 ```bash
 git clone https://github.com/vicode360/macleaner.git
 cd macleaner
 npm install
 ```
 
-### 2. Modo de desenvolvimento
+### Development
 ```bash
 npm run tauri dev
 ```
-O ícone do **Macleaner** aparecerá na barra superior do macOS. Clique com o botão esquerdo para abrir o popover ou com o botão direito para encerrar (**Quit Macleaner**).
+The Macleaner icon appears in the macOS menu bar. Left-click to toggle the popover; right-click to quit (**Quit Macleaner**).
 
-### 3. Gerar pacote de produção (`.app` e `.dmg`)
+### Production Build
 ```bash
 npm run tauri build
 ```
-Os artefatos gerados ficam em `src-tauri/target/release/bundle/`.
+Output bundles (`.app` and `.dmg`) are generated in `src-tauri/target/release/bundle/`.
 
-### 4. Checagens e testes
+### Verification
 ```bash
 npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
@@ -73,24 +72,32 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -
 
 ---
 
-## Arquitetura do Projeto
+## Project Structure
 
 ```text
 macleaner/
-├── index.html                  # Shell HTML do popover (380x480)
+├── index.html                  # Popover HTML entry (380x480)
 ├── src/
-│   ├── main.ts                 # UI nativa (3 abas), ícones Lucide e chamadas IPC
-│   ├── i18n.ts                 # Traduções PT-BR / EN / ES e formatação Intl
-│   ├── styles.css              # Tokens Aqua HIG (Light/Dark) e popover translúcido
-│   └── types.ts                # Contratos TypeScript 1:1 com structs Rust Serde
+│   ├── main.ts                 # Native 3-tab UI, Lucide icons, and Tauri IPC calls
+│   ├── i18n.ts                 # Localization (PT-BR, EN, ES) and Intl formatting
+│   ├── styles.css              # Apple HIG / Aqua-inspired Light & Dark tokens
+│   └── types.ts                # 1:1 TypeScript definitions matching Rust Serde structs
 └── src-tauri/
-    ├── rules/known.toml        # Regras determinísticas macOS + proteção SIP/TCC
+    ├── rules/known.toml        # Embedded macOS cleanup rules and SIP/TCC denylist
     ├── capabilities/default.json
     ├── tauri.conf.json
     └── src/
-        ├── lib.rs              # ActivationPolicy::Accessory, TrayIcon, Positioner e Vibrancy
-        ├── rules.rs            # Engine de regras (include_str!) e filtro SIP/TCC
-        ├── scanner.rs          # Varredura paralela (jwalk + rayon), subpastas, sysinfo e trash
-        ├── ai.rs               # Cliente Ollama loopback / API HTTPS com fallback conservador
-        └── commands.rs         # Comandos IPC Tauri, persistência e checagem de updates
+        ├── lib.rs              # Accessory policy, TrayIcon, Positioner, and Vibrancy
+        ├── rules.rs            # Embedded rule engine and SIP/TCC path protection
+        ├── scanner.rs          # Parallel jwalk + rayon scanner, sysinfo disk health, and Trash moves
+        ├── ai.rs               # Loopback Ollama / HTTPS external API client with conservative fallback
+        └── commands.rs         # Tauri IPC commands, settings persistence, and release checker
 ```
+
+---
+
+## Privacy & Safety Guarantees
+
+- **Zero permanent deletion:** Removal uses only `trash::delete` to move items to the macOS Trash.
+- **Metadata-only AI prompts:** Only directory names, sanitized relative paths (`~/...`), sizes, file counts, ages, and extension totals are sent—never file contents.
+- **Localhost enforcement:** Ollama endpoints are restricted to loopback HTTP (`127.0.0.1`, `localhost`, `::1`); external API endpoints require HTTPS and redact API keys in debug logs.
