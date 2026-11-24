@@ -34,7 +34,7 @@ type RiskFilter = "todos" | RiskLevel;
 
 interface PendingTrashAction {
   paths: string[];
-  label: string;
+  getLabel: () => string;
 }
 
 interface AppViewState {
@@ -46,6 +46,7 @@ interface AppViewState {
   diskHealth: DiskHealth | null;
   summary: ScanSummary | null;
   aiConfig: AiConfig | null;
+  settingsDraft: AiConfig | null;
   installedOllamaModels: string[];
   expandedItemIds: Set<string>;
   scanning: boolean;
@@ -61,13 +62,14 @@ interface AppViewState {
 
 const state: AppViewState = {
   activeTab: "resumo",
-  appVersion: "0.1.0",
+  appVersion: "0.1.5",
   language: "pt-br",
   updateResult: null,
   checkingUpdate: false,
   diskHealth: null,
   summary: null,
   aiConfig: null,
+  settingsDraft: null,
   installedOllamaModels: [],
   expandedItemIds: new Set<string>(),
   scanning: false,
@@ -160,6 +162,9 @@ function setActiveTab(tab: TabId): void {
   panelResumo.hidden = tab !== "resumo";
   panelItens.hidden = tab !== "itens";
   panelAjustes.hidden = tab !== "ajustes";
+  if (tab === "ajustes" && !state.trashing) {
+    state.pendingConfirm = null;
+  }
   renderActiveTab();
 }
 
@@ -173,7 +178,7 @@ function updateChrome(): void {
   }
 
   versionTag.textContent = `v${state.appVersion}`;
-  rescanIconBtn.disabled = state.scanning;
+  rescanIconBtn.disabled = state.scanning || state.trashing;
   rescanIconBtn.classList.toggle("is-spinning", state.scanning);
   rescanIconBtn.setAttribute("aria-label", copy.header.rescanAria);
   rescanIconBtn.title = copy.summary.scanDisk;
@@ -182,10 +187,12 @@ function updateChrome(): void {
   }
 
   updateHeaderBtn.disabled = state.checkingUpdate;
+  updateHeaderBtn.setAttribute("aria-label", copy.header.checkUpdateTitle);
   updateHeaderBtn.replaceChildren(icon(ArrowUpCircle, 12));
   if (state.checkingUpdate) {
     updateHeaderBtn.append(document.createTextNode(copy.header.checkingUpdate));
     updateHeaderBtn.classList.remove("has-update");
+    updateHeaderBtn.title = copy.header.checkingUpdate;
   } else if (state.updateResult?.updateAvailable && state.updateResult.latestVersion) {
     updateHeaderBtn.append(document.createTextNode(`v${state.updateResult.latestVersion}`));
     updateHeaderBtn.classList.add("has-update");
@@ -227,8 +234,8 @@ function updateConfirmBar(): void {
     confirmAcceptBtn.replaceChildren(icon(Trash2, 12), document.createTextNode(copy.items.moveToTrash));
     return;
   }
-  confirmMessage.textContent = state.pendingConfirm.label;
-  confirmAcceptBtn.disabled = state.trashing;
+  confirmMessage.textContent = state.pendingConfirm.getLabel();
+  confirmAcceptBtn.disabled = state.trashing || state.scanning;
   confirmCancelBtn.disabled = state.trashing;
   confirmAcceptBtn.replaceChildren(
     icon(Trash2, 12),
@@ -351,7 +358,7 @@ function renderResumo(): void {
   const actionRow = el("div", "action-row");
   const scanBtn = el("button", "btn btn-primary");
   scanBtn.type = "button";
-  scanBtn.disabled = state.scanning;
+  scanBtn.disabled = state.scanning || state.trashing;
   scanBtn.append(
     icon(ScanSearch, 14),
     document.createTextNode(
@@ -371,6 +378,7 @@ function renderResumo(): void {
   if (safeTargets.paths.length > 0 && !state.scanning) {
     const cleanSafeBtn = el("button", "btn btn-secondary tabular");
     cleanSafeBtn.type = "button";
+    cleanSafeBtn.disabled = state.trashing;
     cleanSafeBtn.append(
       icon(Trash2, 13),
       document.createTextNode(copy.summary.cleanSafeCount(safeTargets.paths.length)),
@@ -477,6 +485,7 @@ function renderItens(): void {
   if (safeTargets.paths.length > 0) {
     const cleanAllBtn = el("button", "btn btn-secondary btn-xs");
     cleanAllBtn.type = "button";
+    cleanAllBtn.disabled = state.scanning || state.trashing;
     cleanAllBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.cleanSafe));
     cleanAllBtn.addEventListener("click", () => {
       requestCleanSafeTargets();
@@ -515,7 +524,7 @@ function renderItens(): void {
     );
     if (item.aiClassified) {
       const chip = el("span", "ai-chip");
-      chip.append(icon(Sparkles, 10), document.createTextNode("IA"));
+      chip.append(icon(Sparkles, 10), document.createTextNode(state.language === "en" ? "AI" : "IA"));
       titleGroup.append(chip);
     }
     top.append(
@@ -573,14 +582,16 @@ function renderItens(): void {
 
     const trashBtn = el("button", "btn btn-ghost btn-xs");
     trashBtn.type = "button";
+    trashBtn.disabled = state.scanning || state.trashing;
     trashBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.trash));
     trashBtn.addEventListener("click", () => {
       state.pendingConfirm = {
         paths: [item.path],
-        label: copy.items.confirmTrashItem(
-          item.name,
-          formatBytes(item.sizeBytes, state.language),
-        ),
+        getLabel: () =>
+          getCopy(state.language).items.confirmTrashItem(
+            item.name,
+            formatBytes(item.sizeBytes, state.language),
+          ),
       };
       updateConfirmBar();
     });
@@ -616,14 +627,16 @@ function renderItens(): void {
 
         const subTrashBtn = el("button", "btn btn-ghost btn-xs");
         subTrashBtn.type = "button";
+        subTrashBtn.disabled = state.scanning || state.trashing;
         subTrashBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.trash));
         subTrashBtn.addEventListener("click", () => {
           state.pendingConfirm = {
             paths: [sub.path],
-            label: copy.items.confirmTrashItem(
-              sub.name,
-              formatBytes(sub.sizeBytes, state.language),
-            ),
+            getLabel: () =>
+              getCopy(state.language).items.confirmTrashItem(
+                sub.name,
+                formatBytes(sub.sizeBytes, state.language),
+              ),
           };
           updateConfirmBar();
         });
@@ -652,7 +665,10 @@ function renderAjustes(): void {
     return;
   }
 
-  const draft: AiConfig = { ...cfg };
+  if (!state.settingsDraft) {
+    state.settingsDraft = { ...cfg };
+  }
+  const draft: AiConfig = state.settingsDraft;
 
   const form = el("form", "settings-form");
   form.addEventListener("submit", (event) => {
@@ -686,7 +702,7 @@ function renderAjustes(): void {
     const chosen = langSelect.value as AppLanguage;
     draft.language = chosen;
     state.language = chosen;
-    void saveLanguagePreference(draft);
+    void saveLanguagePreference(chosen);
   });
   langField.append(langLabel, langSelect);
   langSection.append(langField, el("p", "muted", copy.settings.languageHint));
@@ -840,19 +856,6 @@ function renderAjustes(): void {
     }
   }
 
-  providerSelect.addEventListener("change", () => {
-    draft.provider = providerSelect.value as AiProvider;
-    state.settingsError = null;
-    renderProviderInputs();
-  });
-
-  renderProviderInputs();
-  aiSection.append(dynamicFields);
-
-  if (state.settingsError) {
-    aiSection.append(el("p", "inline-error", state.settingsError));
-  }
-
   const actions = el("div", "action-row");
   const detectBtn = el(
     "button",
@@ -864,6 +867,20 @@ function renderAjustes(): void {
   detectBtn.addEventListener("click", () => {
     void detectOllamaModels(draft);
   });
+
+  providerSelect.addEventListener("change", () => {
+    draft.provider = providerSelect.value as AiProvider;
+    state.settingsError = null;
+    detectBtn.disabled = state.detectingModels || draft.provider !== "ollama";
+    renderProviderInputs();
+  });
+
+  renderProviderInputs();
+  aiSection.append(dynamicFields);
+
+  if (state.settingsError) {
+    aiSection.append(el("p", "inline-error", state.settingsError));
+  }
 
   const saveBtn = el(
     "button",
@@ -933,17 +950,17 @@ function collectSafeTargets(): { paths: string[]; totalBytes: number } {
 }
 
 function requestCleanSafeTargets(): void {
-  const copy = getCopy(state.language);
   const safeTargets = collectSafeTargets();
   if (safeTargets.paths.length === 0) {
     return;
   }
   state.pendingConfirm = {
     paths: safeTargets.paths,
-    label: copy.items.confirmTrashSafe(
-      safeTargets.paths.length,
-      formatBytes(safeTargets.totalBytes, state.language),
-    ),
+    getLabel: () =>
+      getCopy(state.language).items.confirmTrashSafe(
+        safeTargets.paths.length,
+        formatBytes(safeTargets.totalBytes, state.language),
+      ),
   };
   updateConfirmBar();
 }
@@ -957,7 +974,7 @@ async function refreshDiskHealth(): Promise<void> {
 }
 
 async function runScan(): Promise<void> {
-  if (state.scanning) {
+  if (state.scanning || state.trashing) {
     return;
   }
   const copy = getCopy(state.language);
@@ -969,7 +986,7 @@ async function runScan(): Promise<void> {
   const channel = new Channel<ScanEvent>();
   channel.onmessage = (msg) => {
     if (msg.event === "progress") {
-      state.scanProgressText = msg.data.currentPath.startsWith("IA (")
+      state.scanProgressText = /^(?:IA|AI) \(/.test(msg.data.currentPath)
         ? msg.data.currentPath
         : getCopy(state.language).summary.scanningPath(msg.data.currentPath);
       if (state.activeTab === "resumo") {
@@ -984,6 +1001,15 @@ async function runScan(): Promise<void> {
       onEvent: channel,
     });
     state.summary = summary;
+    const validIds = new Set(summary.items.map((item) => item.id));
+    for (const id of state.expandedItemIds) {
+      if (!validIds.has(id)) {
+        state.expandedItemIds.delete(id);
+      }
+    }
+    if (state.highlightedItemId && !validIds.has(state.highlightedItemId)) {
+      state.highlightedItemId = null;
+    }
     const [diskResult, configResult] = await Promise.allSettled([
       invoke<DiskHealth>("get_disk_health"),
       invoke<AiConfig>("get_ai_config"),
@@ -1018,14 +1044,14 @@ function recomputeItemCleanableBytes(item: ScanItem): number {
 }
 
 async function executeTrash(paths: string[]): Promise<void> {
-  if (state.trashing || paths.length === 0) {
+  if (state.trashing || state.scanning || paths.length === 0) {
     state.pendingConfirm = null;
     updateConfirmBar();
     return;
   }
 
   state.trashing = true;
-  updateConfirmBar();
+  renderActiveTab();
 
   try {
     const result = await invoke<TrashResult>("trash_items", { paths });
@@ -1035,6 +1061,10 @@ async function executeTrash(paths: string[]): Promise<void> {
 
       for (const item of state.summary.items) {
         if (removed.has(item.path)) {
+          state.expandedItemIds.delete(item.id);
+          if (state.highlightedItemId === item.id) {
+            state.highlightedItemId = null;
+          }
           continue;
         }
         const remainingSubs = item.subitems.filter((sub) => !removed.has(sub.path));
@@ -1047,6 +1077,10 @@ async function executeTrash(paths: string[]): Promise<void> {
 
         const nextSize = Math.max(0, item.sizeBytes - removedSubBytes);
         if (nextSize === 0 && remainingSubs.length === 0 && removedSubBytes > 0) {
+          state.expandedItemIds.delete(item.id);
+          if (state.highlightedItemId === item.id) {
+            state.highlightedItemId = null;
+          }
           continue;
         }
 
@@ -1060,6 +1094,10 @@ async function executeTrash(paths: string[]): Promise<void> {
         nextItem.cleanableBytes = recomputeItemCleanableBytes(nextItem);
         updatedItems.push(nextItem);
       }
+
+      updatedItems.sort(
+        (a, b) => b.sizeBytes - a.sizeBytes || a.name.localeCompare(b.name),
+      );
 
       state.summary = {
         ...state.summary,
@@ -1115,11 +1153,20 @@ async function checkUpdates(): Promise<void> {
   }
 }
 
-async function saveLanguagePreference(draft: AiConfig): Promise<void> {
+async function saveLanguagePreference(language: AppLanguage): Promise<void> {
+  if (!state.aiConfig) {
+    renderActiveTab();
+    return;
+  }
   try {
-    const saved = await invoke<AiConfig>("set_ai_config", { config: draft });
+    const saved = await invoke<AiConfig>("set_ai_config", {
+      config: { ...state.aiConfig, language },
+    });
     state.aiConfig = saved;
     state.language = saved.language;
+    if (state.settingsDraft) {
+      state.settingsDraft.language = saved.language;
+    }
     renderActiveTab();
   } catch {
     renderActiveTab();
@@ -1129,11 +1176,13 @@ async function saveLanguagePreference(draft: AiConfig): Promise<void> {
 async function saveSettings(draft: AiConfig): Promise<void> {
   state.savingSettings = true;
   state.settingsError = null;
+  state.settingsDraft = { ...draft };
   renderAjustes();
 
   try {
     const saved = await invoke<AiConfig>("set_ai_config", { config: draft });
     state.aiConfig = saved;
+    state.settingsDraft = { ...saved };
     state.language = saved.language;
     showToast(getCopy(state.language).toasts.settingsSaved);
   } catch (err) {
@@ -1147,11 +1196,13 @@ async function saveSettings(draft: AiConfig): Promise<void> {
 async function detectOllamaModels(draft: AiConfig): Promise<void> {
   state.detectingModels = true;
   state.settingsError = null;
+  state.settingsDraft = { ...draft };
   renderAjustes();
 
   try {
     const saved = await invoke<AiConfig>("set_ai_config", { config: draft });
     state.aiConfig = saved;
+    state.settingsDraft = { ...saved };
     const models = await invoke<string[]>("list_ollama_models");
     state.installedOllamaModels = models;
     if (models.length > 0 && (!saved.ollamaModel || !models.includes(saved.ollamaModel))) {
@@ -1159,6 +1210,7 @@ async function detectOllamaModels(draft: AiConfig): Promise<void> {
         config: { ...saved, ollamaModel: models[0] },
       });
       state.aiConfig = updated;
+      state.settingsDraft = { ...updated };
     }
     const copy = getCopy(state.language);
     showToast(
@@ -1199,7 +1251,9 @@ function wireEvents(): void {
 
   updateHeaderBtn.addEventListener("click", () => {
     if (state.updateResult?.updateAvailable && state.updateResult.releaseUrl) {
-      void invoke("open_release_url", { url: state.updateResult.releaseUrl });
+      void invoke("open_release_url", { url: state.updateResult.releaseUrl }).catch((err) => {
+        showToast(getCopy(state.language).toasts.updateError(String(err)));
+      });
     } else {
       void checkUpdates();
     }

@@ -1,18 +1,23 @@
 //! Parallel filesystem scanner using jwalk and rayon for macOS directories.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use jwalk::WalkDir;
+use jwalk::{WalkDir, WalkDirGeneric};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
 
-use crate::rules::{classify_subpath, normalize_path, RiskLevel, RuleEngine};
+use crate::rules::{
+    classify_subpath, normalize_path, path_starts_with_platform, paths_equal_platform, RiskLevel,
+    RuleEngine,
+};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const SECONDS_PER_DAY: u64 = 86_400;
@@ -30,8 +35,12 @@ const DIRECT_TARGET_SUFFIXES: &[&str] = &[
     ".cargo/registry",
     ".npm",
     ".ollama/models",
+    ".gradle/caches",
+    ".m2/repository",
+    ".orbstack",
     "Library/pnpm/store",
     "Library/Logs",
+    "Library/Containers/com.docker.docker",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,12 +187,41 @@ struct DirStats {
     size_bytes: u64,
     file_count: u64,
     latest_modified: Option<SystemTime>,
-    depth1: HashMap<PathBuf, ChildStats>,
-    depth2: HashMap<PathBuf, HashMap<PathBuf, ChildStats>>,
+    depth1: HashMap<OsString, ChildStats>,
+    depth2: HashMap<OsString, HashMap<OsString, ChildStats>>,
     extensions: HashMap<String, (u64, u64)>,
 }
 
 impl DirStats {
+    fn record_extension(&mut self, file_path: &Path, size_bytes: u64) {
+        let Some(ext) = file_path.extension().and_then(|e| e.to_str()) else {
+            return;
+        };
+        if ext.is_empty() || ext.len() > 16 {
+            return;
+        }
+        if ext.is_ascii() {
+            let mut buf = [0_u8; 17];
+            buf[0] = b'.';
+            for (dst, src) in buf[1..=ext.len()].iter_mut().zip(ext.bytes()) {
+                *dst = src.to_ascii_lowercase();
+            }
+            if let Ok(key) = std::str::from_utf8(&buf[..=ext.len()]) {
+                if let Some(entry) = self.extensions.get_mut(key) {
+                    entry.0 = entry.0.saturating_add(size_bytes);
+                    entry.1 = entry.1.saturating_add(1);
+                } else {
+                    self.extensions.insert(key.to_owned(), (size_bytes, 1));
+                }
+                return;
+            }
+        }
+        let key = format!(".{}", ext.to_lowercase());
+        let entry = self.extensions.entry(key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(size_bytes);
+        entry.1 = entry.1.saturating_add(1);
+    }
+
     fn record_file(
         &mut self,
         bucket: &Path,
@@ -200,44 +238,43 @@ impl DirStats {
             });
         }
 
-        if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
-            if !ext.is_empty() && ext.len() <= 16 {
-                let key = format!(".{}", ext.to_lowercase());
-                let entry = self.extensions.entry(key).or_insert((0, 0));
-                entry.0 = entry.0.saturating_add(size_bytes);
-                entry.1 = entry.1.saturating_add(1);
-            }
-        }
+        self.record_extension(file_path, size_bytes);
 
         let Ok(rel) = file_path.strip_prefix(bucket) else {
             return;
         };
         let mut comps = rel.components().filter_map(|c| match c {
-            Component::Normal(part) => Some(part.to_os_string()),
+            Component::Normal(part) => Some(part),
             _ => None,
         });
 
         let Some(first) = comps.next() else {
             return;
         };
-        let d1_path = bucket.join(&first);
         let second = comps.next();
         let third = comps.next();
 
-        self.depth1.entry(d1_path.clone()).or_default().record(
-            size_bytes,
-            modified,
-            second.is_some(),
-        );
+        if let Some(d1) = self.depth1.get_mut(first) {
+            d1.record(size_bytes, modified, second.is_some());
+        } else {
+            let mut stats = ChildStats::default();
+            stats.record(size_bytes, modified, second.is_some());
+            self.depth1.insert(first.to_os_string(), stats);
+        }
 
         if let Some(second_part) = second {
-            let d2_path = d1_path.join(second_part);
-            self.depth2
-                .entry(d1_path)
-                .or_default()
-                .entry(d2_path)
-                .or_default()
-                .record(size_bytes, modified, third.is_some());
+            let d2_map = if let Some(map) = self.depth2.get_mut(first) {
+                map
+            } else {
+                self.depth2.entry(first.to_os_string()).or_default()
+            };
+            if let Some(d2) = d2_map.get_mut(second_part) {
+                d2.record(size_bytes, modified, third.is_some());
+            } else {
+                let mut stats = ChildStats::default();
+                stats.record(size_bytes, modified, third.is_some());
+                d2_map.insert(second_part.to_os_string(), stats);
+            }
         }
     }
 
@@ -251,13 +288,13 @@ impl DirStats {
             });
         }
 
-        for (d1_path, stats) in other.depth1 {
-            self.depth1.entry(d1_path).or_default().merge(stats);
+        for (d1_name, stats) in other.depth1 {
+            self.depth1.entry(d1_name).or_default().merge(stats);
         }
-        for (d1_path, d2_map) in other.depth2 {
-            let target = self.depth2.entry(d1_path).or_default();
-            for (d2_path, stats) in d2_map {
-                target.entry(d2_path).or_default().merge(stats);
+        for (d1_name, d2_map) in other.depth2 {
+            let target = self.depth2.entry(d1_name).or_default();
+            for (d2_name, stats) in d2_map {
+                target.entry(d2_name).or_default().merge(stats);
             }
         }
         for (ext, (bytes, count)) in other.extensions {
@@ -362,16 +399,21 @@ pub(crate) fn scan_roots_and_direct(
     let active_roots: Vec<PathBuf> = roots
         .iter()
         .map(|root| normalize_path(root))
-        .filter(|root| root.is_dir() && !engine.is_protected_path(root))
+        .filter(|root| {
+            fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_dir())
+                && !engine.is_protected_path(root)
+        })
         .collect();
 
     let active_direct: Vec<PathBuf> = direct_targets
         .iter()
         .map(|target| normalize_path(target))
         .filter(|target| {
-            target.is_dir()
+            fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_dir())
                 && !engine.is_protected_path(target)
-                && !active_roots.iter().any(|root| target.starts_with(root))
+                && !active_roots
+                    .iter()
+                    .any(|root| path_starts_with_platform(target, root))
         })
         .collect();
 
@@ -433,6 +475,21 @@ pub(crate) fn scan_roots_and_direct(
         .map(|(dir_path, stats)| build_scan_item(engine, &dir_path, &stats, now))
         .collect();
 
+    let item_paths: Vec<PathBuf> = items.iter().map(|i| PathBuf::from(&i.path)).collect();
+    for (idx, item) in items.iter_mut().enumerate() {
+        let candidate = &item_paths[idx];
+        let has_split_child = item_paths.iter().enumerate().any(|(other_idx, other)| {
+            other_idx != idx
+                && path_starts_with_platform(other, candidate)
+                && !paths_equal_platform(other, candidate)
+        });
+        if has_split_child {
+            item.risk = RiskLevel::Alto;
+            item.selected = false;
+            item.cleanable_bytes = 0;
+        }
+    }
+
     items.sort_by(|a, b| {
         b.size_bytes
             .cmp(&a.size_bytes)
@@ -467,6 +524,36 @@ pub(crate) fn summarize_scan(
     }
 }
 
+fn is_within_cleanable_scope(engine: &RuleEngine, candidate: &Path) -> bool {
+    let resolved = fs::canonicalize(candidate).unwrap_or_else(|_| normalize_path(candidate));
+    let home = fs::canonicalize(engine.home_dir())
+        .unwrap_or_else(|_| normalize_path(engine.home_dir()));
+
+    if !path_starts_with_platform(&resolved, &home) || paths_equal_platform(&resolved, &home) {
+        return false;
+    }
+
+    let roots = default_scan_roots(&home);
+    for root in &roots {
+        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if path_starts_with_platform(&resolved, &canonical_root)
+            && !paths_equal_platform(&resolved, &canonical_root)
+        {
+            return true;
+        }
+    }
+
+    let direct_targets = default_direct_targets(&home);
+    for target in &direct_targets {
+        let canonical_target = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
+        if path_starts_with_platform(&resolved, &canonical_target) {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub(crate) fn move_items_to_trash(
     engine: &RuleEngine,
     paths: &[String],
@@ -476,33 +563,76 @@ pub(crate) fn move_items_to_trash(
     let mut failed_paths = Vec::new();
     let mut freed_bytes = 0_u64;
 
-    for raw_path in paths {
-        let candidate = Path::new(raw_path);
-        if engine.is_protected_path(candidate) {
+    let mut normalized_inputs: Vec<(String, PathBuf)> = paths
+        .iter()
+        .map(|raw| (raw.clone(), normalize_path(Path::new(raw))))
+        .collect();
+    normalized_inputs.sort_by_key(|(_, p)| p.components().count());
+
+    let mut accepted_paths: Vec<PathBuf> = Vec::new();
+
+    for (raw_path, normalized) in normalized_inputs {
+        let candidate = Path::new(&raw_path);
+        if !candidate.is_absolute() {
             failed_paths.push(TrashFailure {
-                path: raw_path.clone(),
+                path: raw_path,
                 reason: "Caminho protegido pela política do sistema.".to_string(),
             });
             continue;
         }
 
-        if !candidate.exists() {
+        if engine.is_protected_or_ancestor(candidate) {
             failed_paths.push(TrashFailure {
-                path: raw_path.clone(),
-                reason: "Item não encontrado no disco.".to_string(),
+                path: raw_path,
+                reason: "Caminho protegido pela política do sistema.".to_string(),
             });
+            continue;
+        }
+
+        let meta = match fs::symlink_metadata(candidate) {
+            Ok(meta) => meta,
+            Err(_) => {
+                failed_paths.push(TrashFailure {
+                    path: raw_path,
+                    reason: "Item não encontrado no disco.".to_string(),
+                });
+                continue;
+            }
+        };
+
+        if meta.file_type().is_symlink() {
+            failed_paths.push(TrashFailure {
+                path: raw_path,
+                reason: "Caminho protegido pela política do sistema.".to_string(),
+            });
+            continue;
+        }
+
+        if !is_within_cleanable_scope(engine, candidate) {
+            failed_paths.push(TrashFailure {
+                path: raw_path,
+                reason: "Caminho protegido pela política do sistema.".to_string(),
+            });
+            continue;
+        }
+
+        if accepted_paths
+            .iter()
+            .any(|parent| path_starts_with_platform(&normalized, parent))
+        {
             continue;
         }
 
         match trash::delete(candidate) {
             Ok(()) => {
                 freed_bytes =
-                    freed_bytes.saturating_add(known_sizes.get(raw_path).copied().unwrap_or(0));
-                trashed_paths.push(raw_path.clone());
+                    freed_bytes.saturating_add(known_sizes.get(&raw_path).copied().unwrap_or(0));
+                accepted_paths.push(normalized);
+                trashed_paths.push(raw_path);
             }
             Err(err) => {
                 failed_paths.push(TrashFailure {
-                    path: raw_path.clone(),
+                    path: raw_path,
                     reason: err.to_string(),
                 });
             }
@@ -524,15 +654,184 @@ pub(crate) fn sanitize_relative_path(path: &Path, home_dir: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn walk_accessible_files(
+#[cfg(target_os = "macos")]
+fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    const UF_COMPRESSED: u32 = 0x0000_0020;
+    const SMALL_INLINE_THRESHOLD: u64 = 64 * 1024;
+
+    if (meta.st_flags() & SF_DATALESS) != 0 {
+        return 0;
+    }
+    let apparent = meta.st_size();
+    let allocated = meta.st_blocks().saturating_mul(512);
+    if allocated > 0 {
+        apparent.min(allocated)
+    } else if (meta.st_flags() & UF_COMPRESSED) != 0 || apparent <= SMALL_INLINE_THRESHOLD {
+        apparent
+    } else {
+        0
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    const SMALL_INLINE_THRESHOLD: u64 = 64 * 1024;
+    let apparent = meta.len();
+    let allocated = meta.blocks().saturating_mul(512);
+    if allocated > 0 {
+        apparent.min(allocated)
+    } else if apparent <= SMALL_INLINE_THRESHOLD {
+        apparent
+    } else {
+        0
+    }
+}
+
+#[cfg(not(unix))]
+fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
+    meta.len()
+}
+
+fn scan_single_root(
     engine: &RuleEngine,
     root: &Path,
-    skipped_counter: &Arc<AtomicU64>,
-) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
+    skipped_counter: Arc<AtomicU64>,
+    scanned_bytes_counter: Arc<AtomicU64>,
+    on_event: &(impl Fn(ScanEvent) + Sync),
+) -> HashMap<PathBuf, DirStats> {
     let engine_ref = engine.clone();
-    let skipped_in_walk = Arc::clone(skipped_counter);
+    let skipped_in_walk = Arc::clone(&skipped_counter);
+    let root_path = root.to_path_buf();
 
-    WalkDir::new(root)
+    let walker = WalkDirGeneric::<(Option<Arc<PathBuf>>, Option<Arc<PathBuf>>)>::new(root)
+        .follow_links(false)
+        .skip_hidden(false)
+        .process_read_dir(move |_depth, dir_path, read_dir_state, children| {
+            if dir_path == root_path.as_path() {
+                *read_dir_state = None;
+            } else if read_dir_state.is_none() || engine_ref.classify_path(dir_path).is_some() {
+                *read_dir_state = Some(Arc::new(dir_path.to_path_buf()));
+            }
+
+            let current_bucket = read_dir_state.as_ref();
+
+            children.retain_mut(|child_result| {
+                let Ok(entry) = child_result else {
+                    if let Err(err) = child_result {
+                        if err
+                            .io_error()
+                            .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
+                        {
+                            skipped_in_walk.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    return false;
+                };
+
+                if entry.file_type().is_symlink() {
+                    return false;
+                }
+
+                if engine_ref.is_protected_normalized(&entry.path()) {
+                    return false;
+                }
+
+                if entry.file_type().is_file() {
+                    let Some(bucket) = current_bucket else {
+                        return false;
+                    };
+                    entry.client_state = Some(Arc::clone(bucket));
+                }
+
+                true
+            });
+        });
+
+    let mut buckets: HashMap<PathBuf, DirStats> = HashMap::new();
+    let mut total_root_bytes = 0_u64;
+
+    for entry_result in walker {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                if err
+                    .io_error()
+                    .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
+                {
+                    skipped_counter.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+        };
+
+        if let Some(ref read_err) = entry.read_children_error {
+            if read_err
+                .io_error()
+                .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
+            {
+                skipped_counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let Some(bucket) = entry.client_state.as_ref() else {
+            continue;
+        };
+
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(err) => {
+                if err
+                    .io_error()
+                    .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
+                {
+                    skipped_counter.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+        };
+
+        let size = effective_file_size(&meta);
+        let mtime = meta.modified().ok();
+        let file_path = entry.path();
+        total_root_bytes = total_root_bytes.saturating_add(size);
+
+        if let Some(stats) = buckets.get_mut(bucket.as_path()) {
+            stats.record_file(bucket.as_path(), &file_path, size, mtime);
+        } else {
+            let mut stats = DirStats::default();
+            stats.record_file(bucket.as_path(), &file_path, size, mtime);
+            buckets.insert((**bucket).clone(), stats);
+        }
+    }
+
+    let total_scanned =
+        scanned_bytes_counter.fetch_add(total_root_bytes, Ordering::Relaxed) + total_root_bytes;
+    on_event(ScanEvent::Progress {
+        current_path: sanitize_relative_path(root, engine.home_dir()),
+        scanned_bytes: total_scanned,
+    });
+
+    buckets
+}
+
+fn scan_direct_target(
+    engine: &RuleEngine,
+    target: &Path,
+    skipped_counter: Arc<AtomicU64>,
+    scanned_bytes_counter: Arc<AtomicU64>,
+    on_event: &(impl Fn(ScanEvent) + Sync),
+) -> DirStats {
+    let engine_ref = engine.clone();
+    let skipped_in_walk = Arc::clone(&skipped_counter);
+
+    let walker = WalkDir::new(target)
         .follow_links(false)
         .skip_hidden(false)
         .process_read_dir(move |_depth, _dir_path, _state, children| {
@@ -553,109 +852,54 @@ fn walk_accessible_files(
                     return false;
                 }
 
-                !engine_ref.is_protected_path(&entry.path())
+                !engine_ref.is_protected_normalized(&entry.path())
             });
-        })
-        .into_iter()
-        .filter_map(|entry_result| {
-            let entry = match entry_result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    if err
-                        .io_error()
-                        .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
-                    {
-                        skipped_counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return None;
-                }
-            };
+        });
 
-            if let Some(ref read_err) = entry.read_children_error {
-                if read_err
+    let mut stats = DirStats::default();
+    for entry_result in walker {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                if err
                     .io_error()
                     .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
                 {
                     skipped_counter.fetch_add(1, Ordering::Relaxed);
                 }
+                continue;
             }
+        };
 
-            if !entry.file_type().is_file() {
-                return None;
+        if let Some(ref read_err) = entry.read_children_error {
+            if read_err
+                .io_error()
+                .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
+            {
+                skipped_counter.fetch_add(1, Ordering::Relaxed);
             }
+        }
 
-            match entry.metadata() {
-                Ok(meta) => Some((entry.path(), meta.len(), meta.modified().ok())),
-                Err(err) => {
-                    if err
-                        .io_error()
-                        .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
-                    {
-                        skipped_counter.fetch_add(1, Ordering::Relaxed);
-                    }
-                    None
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(err) => {
+                if err
+                    .io_error()
+                    .is_some_and(|io_err| is_ignorable_io_error(io_err.kind()))
+                {
+                    skipped_counter.fetch_add(1, Ordering::Relaxed);
                 }
+                continue;
             }
-        })
-        .collect()
-}
+        };
 
-fn scan_single_root(
-    engine: &RuleEngine,
-    root: &Path,
-    skipped_counter: Arc<AtomicU64>,
-    scanned_bytes_counter: Arc<AtomicU64>,
-    on_event: &(impl Fn(ScanEvent) + Sync),
-) -> HashMap<PathBuf, DirStats> {
-    let entries = walk_accessible_files(engine, root, &skipped_counter);
-
-    let total_root_bytes: u64 = entries.par_iter().map(|(_, size, _)| *size).sum();
-    let total_scanned =
-        scanned_bytes_counter.fetch_add(total_root_bytes, Ordering::Relaxed) + total_root_bytes;
-    on_event(ScanEvent::Progress {
-        current_path: sanitize_relative_path(root, engine.home_dir()),
-        scanned_bytes: total_scanned,
-    });
-
-    entries
-        .into_par_iter()
-        .fold(
-            HashMap::<PathBuf, DirStats>::new,
-            |mut acc, (file_path, size, mtime)| {
-                if let Some(bucket) = resolve_candidate_dir(engine, root, &file_path) {
-                    acc.entry(bucket.clone())
-                        .or_default()
-                        .record_file(&bucket, &file_path, size, mtime);
-                }
-                acc
-            },
-        )
-        .reduce(HashMap::new, |mut left, right| {
-            for (dir_path, stats) in right {
-                left.entry(dir_path).or_default().merge(stats);
-            }
-            left
-        })
-}
-
-fn scan_direct_target(
-    engine: &RuleEngine,
-    target: &Path,
-    skipped_counter: Arc<AtomicU64>,
-    scanned_bytes_counter: Arc<AtomicU64>,
-    on_event: &(impl Fn(ScanEvent) + Sync),
-) -> DirStats {
-    let entries = walk_accessible_files(engine, target, &skipped_counter);
-    let stats = entries
-        .into_par_iter()
-        .fold(DirStats::default, |mut acc, (file_path, size, mtime)| {
-            acc.record_file(target, &file_path, size, mtime);
-            acc
-        })
-        .reduce(DirStats::default, |mut left, right| {
-            left.merge(right);
-            left
-        });
+        let size = effective_file_size(&meta);
+        stats.record_file(target, &entry.path(), size, meta.modified().ok());
+    }
 
     let total_scanned =
         scanned_bytes_counter.fetch_add(stats.size_bytes, Ordering::Relaxed) + stats.size_bytes;
@@ -665,29 +909,6 @@ fn scan_direct_target(
     });
 
     stats
-}
-
-fn resolve_candidate_dir(engine: &RuleEngine, root: &Path, file_path: &Path) -> Option<PathBuf> {
-    let parent = file_path.parent()?;
-    if parent == root {
-        return None;
-    }
-
-    let mut ancestor = parent;
-    while ancestor != root {
-        if engine.classify_path(ancestor).is_some() {
-            return Some(ancestor.to_path_buf());
-        }
-        let Some(next) = ancestor.parent() else {
-            break;
-        };
-        if next == root {
-            return Some(ancestor.to_path_buf());
-        }
-        ancestor = next;
-    }
-
-    None
 }
 
 fn build_scan_item(
@@ -713,7 +934,14 @@ fn build_scan_item(
     let top_extensions = build_top_extensions(stats);
 
     if let Some(rule) = matched_rule {
-        let cleanable_bytes = compute_cleanable_bytes(rule.risk, stats.size_bytes, &subitems);
+        let has_high_sub = subitems.iter().any(|s| matches!(s.risk, RiskLevel::Alto));
+        let risk = if has_high_sub && matches!(rule.risk, RiskLevel::Baixo) {
+            RiskLevel::Medio
+        } else {
+            rule.risk
+        };
+        let selected = rule.selected_by_default && !has_high_sub;
+        let cleanable_bytes = compute_cleanable_bytes(risk, stats.size_bytes, &subitems);
         return ScanItem {
             id: format!("{}:{}", rule.id, path_str),
             name: rule.name.clone(),
@@ -722,11 +950,11 @@ fn build_scan_item(
             size_bytes: stats.size_bytes,
             file_count: stats.file_count,
             days_since_modified,
-            risk: rule.risk,
+            risk,
             reason: rule.reason.clone(),
             rule_id: Some(rule.id.clone()),
             ai_classified: false,
-            selected: rule.selected_by_default,
+            selected,
             subitems,
             cleanable_bytes,
             top_extensions,
@@ -759,24 +987,25 @@ fn build_subitems(
     now: SystemTime,
     parent_rule: Option<(RiskLevel, &str)>,
 ) -> Vec<ScanSubItem> {
-    let mut candidates: Vec<(&PathBuf, &ChildStats)> = Vec::new();
+    let mut candidates: Vec<(PathBuf, &ChildStats)> = Vec::new();
 
-    for (d1_path, d1_stats) in &stats.depth1 {
+    for (d1_name, d1_stats) in &stats.depth1 {
         if d1_stats.size_bytes == 0 {
             continue;
         }
+        let d1_path = bucket.join(d1_name);
         let expanded = d1_stats.is_dir
             && d1_stats.size_bytes.saturating_mul(2) >= stats.size_bytes
             && stats
                 .depth2
-                .get(d1_path)
+                .get(d1_name)
                 .is_some_and(|map| map.values().filter(|s| s.size_bytes > 0).count() >= 2);
 
         if expanded {
-            if let Some(d2_map) = stats.depth2.get(d1_path) {
-                for (d2_path, d2_stats) in d2_map {
+            if let Some(d2_map) = stats.depth2.get(d1_name) {
+                for (d2_name, d2_stats) in d2_map {
                     if d2_stats.size_bytes > 0 {
-                        candidates.push((d2_path, d2_stats));
+                        candidates.push((d1_path.join(d2_name), d2_stats));
                     }
                 }
                 continue;
@@ -1073,5 +1302,105 @@ mod tests {
 
         assert!(result.trashed_paths.is_empty());
         assert_eq!(result.failed_paths.len(), 1);
+    }
+
+    #[test]
+    fn trash_refuses_ancestors_outside_home_relative_and_symlinks() {
+        let root = unique_temp_dir("trash_boundaries");
+        let caches = root.join("Library/Caches");
+        let mail = root.join("Library/Mail");
+        let desktop = root.join("Desktop/important.txt");
+        fs::create_dir_all(&caches).expect("create caches");
+        fs::create_dir_all(&mail).expect("create mail");
+        fs::create_dir_all(desktop.parent().expect("desktop dir")).expect("create desktop");
+        fs::write(&desktop, b"keep").expect("write desktop file");
+
+        let evil_link = caches.join("evil_link");
+        std::os::unix::fs::symlink(&mail, &evil_link).expect("create symlink");
+
+        let engine =
+            RuleEngine::from_toml_str(include_str!("../rules/known.toml"), &root).expect("parse");
+
+        let targets = vec![
+            root.join("Library").to_string_lossy().into_owned(),
+            caches.to_string_lossy().into_owned(),
+            desktop.to_string_lossy().into_owned(),
+            evil_link.to_string_lossy().into_owned(),
+            "../relative/path".to_string(),
+        ];
+
+        let result = move_items_to_trash(&engine, &targets, &HashMap::new());
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.trashed_paths.is_empty());
+        assert_eq!(result.failed_paths.len(), targets.len());
+    }
+
+    #[test]
+    fn nested_rule_split_clamps_parent_and_sparse_zero_block_is_zero() {
+        let root = unique_temp_dir("split_and_sparse");
+        let xcode = root.join("Library/Developer/Xcode");
+        let derived = xcode.join("DerivedData/App");
+        let archives = xcode.join("Archives/2026");
+        let userdata = xcode.join("UserData");
+        let sparse_dir = root.join("Library/Caches/SparseTest");
+
+        for dir in [&derived, &archives, &userdata, &sparse_dir] {
+            fs::create_dir_all(dir).expect("create dir");
+        }
+        fs::write(derived.join("a.o"), vec![1_u8; 2 * 1024 * 1024]).expect("write derived");
+        fs::write(archives.join("b.xcarchive"), vec![1_u8; 2 * 1024 * 1024])
+            .expect("write archives");
+        fs::write(userdata.join("c.plist"), vec![1_u8; 2 * 1024 * 1024]).expect("write userdata");
+
+        let sparse_file = fs::File::create(sparse_dir.join("Docker.raw")).expect("create sparse");
+        sparse_file
+            .set_len(100 * 1024 * 1024)
+            .expect("set sparse length");
+        drop(sparse_file);
+
+        let engine =
+            RuleEngine::from_toml_str(include_str!("../rules/known.toml"), &root).expect("parse");
+        let output = scan_with_engine(&engine, 1, &|_| {});
+        let _ = fs::remove_dir_all(&root);
+
+        let xcode_parent = output
+            .items
+            .iter()
+            .find(|item| item.path.ends_with("/Library/Developer/Xcode"))
+            .expect("xcode parent present");
+        assert_eq!(xcode_parent.risk, RiskLevel::Alto);
+        assert!(!xcode_parent.selected);
+        assert_eq!(xcode_parent.cleanable_bytes, 0);
+
+        assert!(
+            !output
+                .items
+                .iter()
+                .any(|item| item.path.ends_with("/SparseTest")),
+            "0-block sparse file should not inflate scan size"
+        );
+    }
+
+    #[test]
+    fn stress_scan_handles_thousands_of_nested_files_fast() {
+        let root = unique_temp_dir("stress_2k");
+        let cache_root = root.join("Library/Caches/HeavyStressApp");
+        for bucket_idx in 0..20 {
+            let sub = cache_root.join(format!("shard_{bucket_idx}/nested"));
+            fs::create_dir_all(&sub).expect("create shard");
+            for file_idx in 0..100 {
+                fs::write(sub.join(format!("f_{file_idx}.bin")), [0_u8; 1024]).expect("write file");
+            }
+        }
+
+        let engine =
+            RuleEngine::from_toml_str(include_str!("../rules/known.toml"), &root).expect("parse");
+        let output = scan_with_engine(&engine, 1, &|_| {});
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(output.items[0].file_count, 2000);
+        assert_eq!(output.items[0].size_bytes, 2000 * 1024);
     }
 }

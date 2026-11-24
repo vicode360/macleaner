@@ -1,13 +1,19 @@
 //! AI classification client supporting local Ollama and optional external HTTPS APIs.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri_plugin_http::reqwest::{self, Url};
 use thiserror::Error;
 
-use crate::rules::RiskLevel;
+use crate::rules::{path_starts_with_platform, RiskLevel};
+
+static TMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_500);
@@ -18,6 +24,9 @@ const DEFAULT_OLLAMA_MODEL: &str = "auto";
 const DEFAULT_EXTERNAL_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_EXTERNAL_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_TIMEOUT_MS: u64 = 20_000;
+const MAX_AI_CACHE_ENTRIES: usize = 256;
+const CACHE_SIZE_TOLERANCE_BYTES: u64 = 1024 * 1024;
+const CACHE_FILE_COUNT_TOLERANCE: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -29,6 +38,15 @@ pub enum AppLanguage {
 }
 
 impl AppLanguage {
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PtBr => "pt-br",
+            Self::En => "en",
+            Self::Es => "es",
+        }
+    }
+
     fn prompt_name(self) -> &'static str {
         match self {
             Self::PtBr => "Portuguese (Brazil)",
@@ -109,7 +127,8 @@ pub struct AiStatus {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiSubfolderVerdict {
     pub name: String,
     pub risk: RiskLevel,
@@ -117,11 +136,153 @@ pub struct AiSubfolderVerdict {
     pub safe_to_clean: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiClassification {
     pub risk: RiskLevel,
     pub reason: String,
     pub subfolders: Vec<AiSubfolderVerdict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiCacheEntry {
+    #[serde(default)]
+    folder_path: String,
+    size_bytes: u64,
+    file_count: u64,
+    classification: AiClassification,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AiCacheKey<'a> {
+    pub folder_path: &'a str,
+    pub language: AppLanguage,
+    pub provider: AiProvider,
+    pub model: &'a str,
+    pub size_bytes: u64,
+    pub file_count: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct AiClassificationCache {
+    entries: HashMap<String, AiCacheEntry>,
+}
+
+impl AiClassificationCache {
+    #[must_use]
+    pub fn load(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let payload = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        let seq = TMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(
+            "{}.{}.{seq}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("ai_cache.json"),
+            std::process::id()
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        fs::write(&tmp_path, payload)?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn get(&self, lookup: AiCacheKey<'_>) -> Option<AiClassification> {
+        let key = cache_key(
+            lookup.folder_path,
+            lookup.language,
+            lookup.provider,
+            lookup.model,
+        );
+        let entry = self.entries.get(&key)?;
+        if is_cache_entry_fresh(entry, lookup.size_bytes, lookup.file_count) {
+            Some(entry.classification.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, lookup: AiCacheKey<'_>, classification: AiClassification) {
+        let key = cache_key(
+            lookup.folder_path,
+            lookup.language,
+            lookup.provider,
+            lookup.model,
+        );
+        if !self.entries.contains_key(&key) {
+            while self.entries.len() >= MAX_AI_CACHE_ENTRIES {
+                let Some(old_key) = self.entries.keys().next().cloned() else {
+                    break;
+                };
+                self.entries.remove(&old_key);
+            }
+        }
+        self.entries.insert(
+            key,
+            AiCacheEntry {
+                folder_path: lookup.folder_path.to_string(),
+                size_bytes: lookup.size_bytes,
+                file_count: lookup.file_count,
+                classification,
+            },
+        );
+    }
+
+    pub fn remove_path(&mut self, removed_path: &str) {
+        let removed = Path::new(removed_path);
+        self.entries.retain(|key, entry| {
+            let entry_path_str = if entry.folder_path.is_empty() {
+                key.rsplit("::").next().unwrap_or("")
+            } else {
+                entry.folder_path.as_str()
+            };
+            let entry_path = Path::new(entry_path_str);
+            !path_starts_with_platform(entry_path, removed)
+                && !path_starts_with_platform(removed, entry_path)
+        });
+    }
+}
+
+fn provider_code(provider: AiProvider) -> &'static str {
+    match provider {
+        AiProvider::Ollama => "ollama",
+        AiProvider::ExternalApi => "external",
+        AiProvider::Disabled => "disabled",
+    }
+}
+
+fn cache_key(
+    folder_path: &str,
+    language: AppLanguage,
+    provider: AiProvider,
+    model: &str,
+) -> String {
+    format!(
+        "{}::{}::{}::{}",
+        language.code(),
+        provider_code(provider),
+        model.trim(),
+        folder_path
+    )
+}
+
+fn is_cache_entry_fresh(entry: &AiCacheEntry, size_bytes: u64, file_count: u64) -> bool {
+    let size_diff = entry.size_bytes.abs_diff(size_bytes);
+    let max_size_diff = (entry.size_bytes / 20).max(CACHE_SIZE_TOLERANCE_BYTES);
+    let file_diff = entry.file_count.abs_diff(file_count);
+    let max_file_diff = (entry.file_count / 20).max(CACHE_FILE_COUNT_TOLERANCE);
+    size_diff <= max_size_diff && file_diff <= max_file_diff
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -686,7 +847,13 @@ fn parse_classification_json(raw: &str) -> Option<AiClassification> {
         .unwrap_or(raw.trim());
     let cleaned = trimmed.strip_suffix("```").unwrap_or(trimmed).trim();
 
-    let parsed: RawAiClassification = serde_json::from_str(cleaned).ok()?;
+    let parsed: RawAiClassification = serde_json::from_str(cleaned)
+        .ok()
+        .or_else(|| {
+            find_json_objects(cleaned)
+                .into_iter()
+                .find_map(|slice| serde_json::from_str::<RawAiClassification>(slice).ok())
+        })?;
     let reason = parsed.reason.trim();
     if reason.is_empty() {
         return None;
@@ -709,6 +876,52 @@ fn parse_classification_json(raw: &str) -> Option<AiClassification> {
         reason: reason.to_string(),
         subfolders,
     })
+}
+
+fn find_json_objects(input: &str) -> Vec<&str> {
+    let mut results = Vec::new();
+    let mut depth = 0_usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in input.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                if depth > 0 {
+                    in_string = true;
+                }
+            }
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(begin) = start.take() {
+                        results.push(&input[begin..=idx]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    results
 }
 
 #[cfg(test)]
@@ -793,6 +1006,76 @@ mod tests {
         assert!(parsed_fenced.subfolders.is_empty());
 
         assert!(parse_classification_json(r#"{"risk":"unknown","reason":"x"}"#).is_none());
+
+        let with_preamble = "<think>checking {cache}</think> {\"risk\":\"medio\",\"reason\":\"Pasta \\\"ação\\\" {1} 🚀\",\"subfolders\":[]}";
+        let parsed_preamble =
+            parse_classification_json(with_preamble).expect("extracts second valid json object");
+        assert_eq!(parsed_preamble.risk, RiskLevel::Medio);
+        assert!(parsed_preamble.reason.contains("ação"));
+
+        assert!(parse_classification_json(r#"{"risk":"baixo""#).is_none());
+    }
+
+    #[test]
+    fn ai_cache_handles_eviction_model_keys_and_subitem_invalidation() {
+        let mut cache = AiClassificationCache::default();
+        let sample = AiClassification {
+            risk: RiskLevel::Medio,
+            reason: "Cache de testes.".to_string(),
+            subfolders: vec![],
+        };
+
+        for idx in 0..MAX_AI_CACHE_ENTRIES {
+            let path = format!("/Users/tester/Library/Caches/App{idx}");
+            cache.insert(
+                AiCacheKey {
+                    folder_path: &path,
+                    language: AppLanguage::En,
+                    provider: AiProvider::Ollama,
+                    model: "qwen3:8b",
+                    size_bytes: 10_000_000,
+                    file_count: 50,
+                },
+                sample.clone(),
+            );
+        }
+        assert_eq!(cache.entries.len(), MAX_AI_CACHE_ENTRIES);
+
+        cache.insert(
+            AiCacheKey {
+                folder_path: "/Users/tester/Library/Caches/App0",
+                language: AppLanguage::En,
+                provider: AiProvider::Ollama,
+                model: "qwen3:8b",
+                size_bytes: 10_000_000,
+                file_count: 50,
+            },
+            sample.clone(),
+        );
+        assert_eq!(cache.entries.len(), MAX_AI_CACHE_ENTRIES);
+
+        assert!(cache
+            .get(AiCacheKey {
+                folder_path: "/Users/tester/Library/Caches/App0",
+                language: AppLanguage::En,
+                provider: AiProvider::ExternalApi,
+                model: "gpt-4o-mini",
+                size_bytes: 10_000_000,
+                file_count: 50,
+            })
+            .is_none());
+
+        cache.remove_path("/Users/tester/Library/Caches/App0/subcache");
+        assert!(cache
+            .get(AiCacheKey {
+                folder_path: "/Users/tester/Library/Caches/App0",
+                language: AppLanguage::En,
+                provider: AiProvider::Ollama,
+                model: "qwen3:8b",
+                size_bytes: 10_000_000,
+                file_count: 50,
+            })
+            .is_none());
     }
 
     #[test]

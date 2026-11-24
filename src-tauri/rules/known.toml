@@ -20,10 +20,14 @@ tcc_user_paths = [
   "~/Library/Accounts",
   "~/Library/HomeKit",
   "~/Library/IdentityServices",
+  "~/Library/Keychains",
   "~/Library/Metadata/CoreSpotlight",
   "~/Library/Application Support/AddressBook",
   "~/Library/Application Support/CallHistoryDB",
+  "~/Library/Application Support/CloudDocs",
   "~/Library/Application Support/MobileSync",
+  "~/Library/Application Support/com.apple.TCC",
+  "~/.ssh",
   "~/.Trash",
 ]
 
@@ -49,7 +53,7 @@ selected_by_default = true
 id = "homebrew"
 name = "Homebrew Cache"
 category = "developer"
-patterns = ["Homebrew"]
+patterns = ["Caches/Homebrew"]
 risk = "baixo"
 reason = "Instaladores e pacotes antigos armazenados em cache pelo Homebrew."
 selected_by_default = true
@@ -58,7 +62,7 @@ selected_by_default = true
 id = "npm"
 name = "npm Cache"
 category = "developer"
-patterns = ["npm", ".npm"]
+patterns = ["Caches/npm", ".cache/npm", ".npm"]
 risk = "baixo"
 reason = "Cache local de pacotes baixados pelo gerenciador npm."
 selected_by_default = true
@@ -67,7 +71,7 @@ selected_by_default = true
 id = "pnpm"
 name = "pnpm Store & Cache"
 category = "developer"
-patterns = ["pnpm"]
+patterns = ["Caches/pnpm", ".cache/pnpm", "pnpm/store"]
 risk = "baixo"
 reason = "Cache de pacotes mantido pelo pnpm."
 selected_by_default = true
@@ -85,7 +89,7 @@ selected_by_default = true
 id = "pip"
 name = "pip Cache"
 category = "developer"
-patterns = ["pip"]
+patterns = ["Caches/pip", ".cache/pip"]
 risk = "baixo"
 reason = "Pacotes Python em cache baixados anteriormente pelo pip."
 selected_by_default = true
@@ -94,7 +98,7 @@ selected_by_default = true
 id = "go-build"
 name = "Go Build Cache"
 category = "developer"
-patterns = ["go-build"]
+patterns = ["Caches/go-build", ".cache/go-build"]
 risk = "baixo"
 reason = "Cache de compilação incremental do compilador Go."
 selected_by_default = true
@@ -160,4 +164,151 @@ category = "ai"
 patterns = ["ollama/models", ".ollama/models"]
 risk = "medio"
 reason = "Modelos locais do Ollama; removê-los exige novo download."
+selected_by_default = false
+
+[[rule]]
+id = "xcode-device-support"
+name = "Xcode DeviceSupport"
+category = "developer"
+patterns = [
+  "Xcode/iOS DeviceSupport",
+  "Xcode/watchOS DeviceSupport",
+  "Xcode/tvOS DeviceSupport",
+]
+risk = "baixo"
+reason = "Símbolos de depuração de versões antigas do iOS/watchOS; recriados ao reconectar o aparelho."
+selected_by_default = true
+
+[[rule]]
+id = "xcode-archives"
+name = "Xcode Archives"
+category = "developer"
+patterns = ["Xcode/Archives"]
+risk = "medio"
+reason = "Builds arquivados do Xcode para distribuição; revise antes de remover versões antigas."
+selected_by_default = false
+
+[[rule]]
+id = "coresimulator-volumes"
+name = "CoreSimulator Volumes & Devices"
+category = "developer"
+patterns = ["CoreSimulator/Volumes", "CoreSimulator/Devices"]
+risk = "medio"
+reason = "Imagens e dispositivos de simuladores iOS; revise antes de apagar runtimes ativos."
+selected_by_default = false
+
+[[rule]]
+id = "cocoapods-cache"
+name = "CocoaPods Cache"
+category = "developer"
+patterns = ["Caches/CocoaPods"]
+risk = "baixo"
+reason = "Cache de pods baixados pelo CocoaPods; restaurado automaticamente no pod install."
+selected_by_default = true
+
+[[rule]]
+id = "gradle-caches"
+name = "Gradle Caches"
+category = "developer"
+patterns = ["gradle/caches", ".gradle/caches"]
+risk = "baixo"
+reason = "Cache local de dependências e builds do Gradle; baixado novamente ao compilar."
+selected_by_default = true
+
+[[rule]]
+id = "maven-repository"
+name = "Maven Local Repository"
+category = "developer"
+patterns = ["m2/repository", ".m2/repository"]
+risk = "baixo"
+reason = "Artefatos e JARs baixados pelo Maven; restaurados automaticamente no próximo build."
+selected_by_default = true
+
+[[rule]]
+id = "yarn-cache"
+name = "Yarn Cache"
+category = "developer"
+patterns = ["Caches/Yarn", ".cache/yarn"]
+risk = "baixo"
+reason = "Cache local de pacotes JavaScript armazenados pelo Yarn."
+selected_by_default = true
+
+[[rule]]
+id = "uv-cache"
+name = "uv Python Cache"
+category = "developer"
+patterns = ["Caches/uv", ".cache/uv"]
+risk = "baixo"
+reason = "Cache de wheels e ambientes Python gerenciado pelo uv."
+selected_by_default = true
+
+[[rule]]
+id = "playwright-browsers"
+name = "Playwright Browsers"
+category = "developer"
+patterns = ["Caches/ms-playwright", ".cache/ms-playwright"]
+risk = "baixo"
+reason = "Binários de navegadores de teste do Playwright; reinstaláveis com playwright install."
+selected_by_default = true
+
+[[rule]]
+id = "puppeteer-cache"
+name = "Puppeteer Cache"
+category = "developer"
+patterns = ["Caches/puppeteer", ".cache/puppeteer"]
+risk = "baixo"
+reason = "Binários em cache do Chromium baixados pelo Puppeteer."
+selected_by_default = true
+
+[[rule]]
+id = "vscode-cache"
+name = "VS Code Cache"
+category = "developer"
+patterns = [
+  "Code/Cache",
+  "Code/CachedData",
+  "Code/CachedExtensionVSIXs",
+]
+risk = "baixo"
+reason = "Caches temporários e pacotes de extensões do Visual Studio Code."
+selected_by_default = true
+
+[[rule]]
+id = "cursor-cache"
+name = "Cursor Cache"
+category = "developer"
+patterns = [
+  "Cursor/Cache",
+  "Cursor/CachedData",
+  "Cursor/CachedExtensionVSIXs",
+]
+risk = "baixo"
+reason = "Caches temporários e pacotes de extensões do Cursor."
+selected_by_default = true
+
+[[rule]]
+id = "jetbrains-caches"
+name = "JetBrains Caches"
+category = "developer"
+patterns = ["Caches/JetBrains"]
+risk = "baixo"
+reason = "Índices e caches de IDEs JetBrains; reconstruídos automaticamente ao abrir projetos."
+selected_by_default = true
+
+[[rule]]
+id = "docker-desktop"
+name = "Docker Desktop Data"
+category = "developer"
+patterns = ["Containers/com.docker.docker"]
+risk = "alto"
+reason = "Disco virtual (Docker.raw) com imagens, containers e volumes; prefira limpar via docker system prune."
+selected_by_default = false
+
+[[rule]]
+id = "orbstack-data"
+name = "OrbStack Data"
+category = "developer"
+patterns = [".orbstack"]
+risk = "alto"
+reason = "Máquinas Linux e volumes do OrbStack; revise ou limpe diretamente pelo app OrbStack."
 selected_by_default = false

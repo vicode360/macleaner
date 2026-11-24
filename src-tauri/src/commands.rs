@@ -4,19 +4,22 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
+use tauri_plugin_http::reqwest::Url;
 use thiserror::Error;
 
 use crate::ai::{
-    validate_config, AiClient, AiConfig, AiError, AiExtensionEvidence, AiMetadataInput, AiProvider,
-    AiStatus, AiSubfolderEvidence,
+    validate_config, AiCacheKey, AiClassification, AiClassificationCache, AiClient, AiConfig,
+    AiError, AiExtensionEvidence, AiMetadataInput, AiProvider, AiStatus, AiSubfolderEvidence,
+    AppLanguage,
 };
-use crate::rules::{classify_subpath, RiskLevel, RuleEngine, RuleError};
+use crate::rules::{classify_subpath, path_starts_with_platform, paths_equal_platform, RiskLevel, RuleEngine, RuleError};
 use crate::scanner::{
     compute_cleanable_bytes, move_items_to_trash, read_disk_health, sanitize_relative_path,
     scan_with_engine, summarize_scan, DiskHealth, ScanEvent, ScanItem, ScanSummary, TrashResult,
@@ -26,8 +29,8 @@ const MAX_AI_ITEMS_PER_SCAN: usize = 12;
 const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/vicode360/macleaner/releases/latest";
 const GITHUB_RELEASES_PAGE: &str = "https://github.com/vicode360/macleaner/releases";
-const GITHUB_ALLOWED_PREFIX: &str = "https://github.com/vicode360/macleaner/";
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+static CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +62,8 @@ pub enum AppError {
     SettingsIo(String),
     #[error("invalid release URL")]
     InvalidReleaseUrl,
+    #[error("scan already in progress")]
+    ScanInProgress,
 }
 
 impl Serialize for AppError {
@@ -70,12 +75,35 @@ impl Serialize for AppError {
     }
 }
 
+struct ScanGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl ScanGuard {
+    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                flag: Arc::clone(flag),
+            })
+    }
+}
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 pub struct AppState {
     pub(crate) rules: Arc<RuleEngine>,
     pub(crate) ai_client: AiClient,
     pub(crate) ai_config: Mutex<AiConfig>,
     pub(crate) config_path: Option<PathBuf>,
+    pub(crate) ai_cache: Mutex<AiClassificationCache>,
+    pub(crate) ai_cache_path: Option<PathBuf>,
     pub(crate) last_sizes: Mutex<HashMap<String, u64>>,
+    pub(crate) scan_in_progress: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -90,13 +118,24 @@ impl AppState {
             .as_deref()
             .and_then(load_persisted_config)
             .unwrap_or_default();
+        let ai_cache_path = config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("ai_cache.json"));
+        let initial_cache = ai_cache_path
+            .as_deref()
+            .map(AiClassificationCache::load)
+            .unwrap_or_default();
 
         Ok(Self {
             rules,
             ai_client,
             ai_config: Mutex::new(initial_config),
             config_path,
+            ai_cache: Mutex::new(initial_cache),
+            ai_cache_path,
             last_sizes: Mutex::new(HashMap::new()),
+            scan_in_progress: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -109,6 +148,11 @@ pub fn get_app_version() -> String {
 #[tauri::command]
 pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheckResult, AppError> {
     let current = env!("CARGO_PKG_VERSION").to_string();
+    let language = state
+        .ai_config
+        .lock()
+        .expect("ai_config lock poisoned")
+        .language;
     let user_agent = format!("Macleaner/{current}");
 
     let response = match state
@@ -128,9 +172,7 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
                 latest_version: None,
                 update_available: false,
                 release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-                message: format!(
-                    "Sem conexão para verificar atualizações. Versão atual: v{current}."
-                ),
+                message: format_update_offline(language, &current),
             });
         }
     };
@@ -141,7 +183,7 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
             latest_version: None,
             update_available: false,
             release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format!("Versão atual v{current} — nenhuma release publicada ainda."),
+            message: format_update_no_releases(language, &current),
         });
     }
 
@@ -151,10 +193,7 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
             latest_version: None,
             update_available: false,
             release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format!(
-                "Não foi possível verificar atualizações (HTTP {}).",
-                response.status()
-            ),
+            message: format_update_http_error(language, response.status().as_u16()),
         });
     }
 
@@ -164,7 +203,7 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
             latest_version: None,
             update_available: false,
             release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format!("Erro ao ler resposta de releases. Versão atual: v{current}."),
+            message: format_update_parse_error(language, &current),
         });
     };
 
@@ -174,7 +213,7 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
             latest_version: None,
             update_available: false,
             release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format!("Formato de release inesperado. Versão atual: v{current}."),
+            message: format_update_parse_error(language, &current),
         });
     };
 
@@ -185,9 +224,9 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
         .to_string();
     let update_available = is_newer_version(&current, &latest);
     let message = if update_available {
-        format!("Nova versão v{latest} disponível (atual: v{current}).")
+        format_update_available(language, &latest, &current)
     } else {
-        format!("Você já está na versão mais recente (v{current}).")
+        format_update_up_to_date(language, &current)
     };
 
     Ok(UpdateCheckResult {
@@ -201,7 +240,7 @@ pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheck
 
 #[tauri::command]
 pub fn open_release_url(url: String) -> Result<(), AppError> {
-    if !url.starts_with(GITHUB_ALLOWED_PREFIX) {
+    if !is_allowed_release_url(&url) {
         return Err(AppError::InvalidReleaseUrl);
     }
     Command::new("open")
@@ -209,6 +248,16 @@ pub fn open_release_url(url: String) -> Result<(), AppError> {
         .spawn()
         .map_err(|err| AppError::SettingsIo(err.to_string()))?;
     Ok(())
+}
+
+#[must_use]
+fn is_allowed_release_url(raw: &str) -> bool {
+    let Ok(parsed) = Url::parse(raw.trim()) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host_str() == Some("github.com")
+        && parsed.path().starts_with("/vicode360/macleaner/")
 }
 
 #[tauri::command]
@@ -222,6 +271,9 @@ pub async fn scan_system(
     state: State<'_, AppState>,
     on_event: Channel<ScanEvent>,
 ) -> Result<ScanSummary, AppError> {
+    let _scan_guard =
+        ScanGuard::try_acquire(&state.scan_in_progress).ok_or(AppError::ScanInProgress)?;
+
     let mut ai_config = state
         .ai_config
         .lock()
@@ -240,16 +292,49 @@ pub async fn scan_system(
     .await
     .map_err(|err| AppError::TaskJoin(err.to_string()))?;
 
-    let unknown_count = raw
-        .items
-        .iter()
-        .filter(|item| item.rule_id.is_none())
-        .count();
     let mut ai_available = false;
+    let mut uncached_unknown_count = 0_usize;
+    let cache_model = configured_model_key(&ai_config);
 
-    if unknown_count > 0 && ai_config.provider != AiProvider::Disabled {
+    if ai_config.provider != AiProvider::Disabled {
+        let cached_hits: Vec<(usize, AiClassification)> = {
+            let cache = state.ai_cache.lock().expect("ai_cache lock poisoned");
+            raw.items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.rule_id.is_none())
+                .filter_map(|(idx, item)| {
+                    cache
+                        .get(AiCacheKey {
+                            folder_path: &item.path,
+                            language: ai_config.language,
+                            provider: ai_config.provider,
+                            model: &cache_model,
+                            size_bytes: item.size_bytes,
+                            file_count: item.file_count,
+                        })
+                        .map(|hit| (idx, hit))
+                })
+                .collect()
+        };
+
+        if !cached_hits.is_empty() {
+            ai_available = true;
+            for (idx, classification) in cached_hits {
+                apply_classification(&mut raw.items[idx], classification);
+            }
+        }
+
+        uncached_unknown_count = raw
+            .items
+            .iter()
+            .filter(|item| item.rule_id.is_none() && !item.ai_classified)
+            .count();
+    }
+
+    if uncached_unknown_count > 0 && ai_config.provider != AiProvider::Disabled {
         let ai_status = state.ai_client.check_availability(&ai_config).await;
-        ai_available = ai_status.available;
+        ai_available = ai_available || ai_status.available;
 
         if ai_status.available {
             if ai_config.provider == AiProvider::Ollama
@@ -257,39 +342,74 @@ pub async fn scan_system(
                 && ai_config.ollama_model != ai_status.model
             {
                 ai_config.ollama_model = ai_status.model.clone();
-                if let Some(ref path) = state.config_path {
-                    let _ = save_persisted_config(path, &ai_config);
-                }
-                if let Ok(mut guard) = state.ai_config.lock() {
-                    guard.ollama_model = ai_status.model.clone();
+                let fresh_snapshot = {
+                    let mut guard = state.ai_config.lock().expect("ai_config lock poisoned");
+                    if guard.provider == AiProvider::Ollama && guard.ollama_model != "auto" {
+                        guard.ollama_model = ai_status.model.clone();
+                        Some(guard.clone())
+                    } else {
+                        None
+                    }
+                };
+                if let (Some(path), Some(snapshot)) = (state.config_path.as_deref(), fresh_snapshot)
+                {
+                    let _ = save_persisted_config(path, &snapshot);
                 }
             }
 
+            let effective_model = configured_model_key(&ai_config);
             let scanned_bytes = raw.items.iter().map(|item| item.size_bytes).sum();
-            let batch_count = unknown_count.min(MAX_AI_ITEMS_PER_SCAN);
+            let batch_count = uncached_unknown_count.min(MAX_AI_ITEMS_PER_SCAN);
             let _ = on_event.send(ScanEvent::Progress {
-                current_path: format!(
-                    "IA ({}) analisando {batch_count} pastas desconhecidas…",
-                    ai_status.model
-                ),
+                current_path: format_ai_progress(ai_config.language, &ai_status.model, batch_count),
                 scanned_bytes,
             });
 
             let mut analyzed = 0_usize;
+            let mut cache_dirty = false;
             for item in &mut raw.items {
-                if item.rule_id.is_some() {
+                if item.rule_id.is_some() || item.ai_classified {
                     continue;
                 }
                 if analyzed < MAX_AI_ITEMS_PER_SCAN {
-                    apply_ai_with_evidence(
+                    if let Some(classification) = query_ai_with_evidence(
                         &state.ai_client,
                         &state.rules,
                         &ai_config,
                         Some(&ai_status.model),
                         item,
                     )
-                    .await;
+                    .await
+                    {
+                        {
+                            let mut cache = state.ai_cache.lock().expect("ai_cache lock poisoned");
+                            cache.insert(
+                                AiCacheKey {
+                                    folder_path: &item.path,
+                                    language: ai_config.language,
+                                    provider: ai_config.provider,
+                                    model: &effective_model,
+                                    size_bytes: item.size_bytes,
+                                    file_count: item.file_count,
+                                },
+                                classification.clone(),
+                            );
+                        }
+                        apply_classification(item, classification);
+                        cache_dirty = true;
+                    }
                     analyzed += 1;
+                }
+            }
+
+            if cache_dirty {
+                if let Some(ref cache_path) = state.ai_cache_path {
+                    let snapshot = state
+                        .ai_cache
+                        .lock()
+                        .expect("ai_cache lock poisoned")
+                        .clone();
+                    let _ = snapshot.save(cache_path);
                 }
             }
 
@@ -345,9 +465,32 @@ pub async fn trash_items(
     .map_err(|err| AppError::TaskJoin(err.to_string()))?;
 
     if !result.trashed_paths.is_empty() {
-        let mut sizes = state.last_sizes.lock().expect("last_sizes lock poisoned");
-        for removed in &result.trashed_paths {
-            sizes.remove(removed);
+        {
+            let mut sizes = state.last_sizes.lock().expect("last_sizes lock poisoned");
+            for removed in &result.trashed_paths {
+                let removed_bytes = sizes.remove(removed).unwrap_or(0);
+                if removed_bytes > 0 {
+                    let removed_path = Path::new(removed);
+                    for (existing, bytes) in sizes.iter_mut() {
+                        let existing_path = Path::new(existing);
+                        if path_starts_with_platform(removed_path, existing_path)
+                            && !paths_equal_platform(removed_path, existing_path)
+                        {
+                            *bytes = bytes.saturating_sub(removed_bytes);
+                        }
+                    }
+                }
+            }
+        }
+        let cache_snapshot = {
+            let mut cache = state.ai_cache.lock().expect("ai_cache lock poisoned");
+            for removed in &result.trashed_paths {
+                cache.remove_path(removed);
+            }
+            cache.clone()
+        };
+        if let Some(ref cache_path) = state.ai_cache_path {
+            let _ = cache_snapshot.save(cache_path);
         }
     }
 
@@ -396,13 +539,13 @@ pub fn set_ai_config(config: AiConfig, state: State<'_, AppState>) -> Result<AiC
     Ok(config)
 }
 
-async fn apply_ai_with_evidence(
+async fn query_ai_with_evidence(
     ai_client: &AiClient,
     rules: &RuleEngine,
     config: &AiConfig,
     resolved_model: Option<&str>,
-    item: &mut ScanItem,
-) {
+    item: &ScanItem,
+) -> Option<AiClassification> {
     let relative = sanitize_relative_path(Path::new(&item.path), rules.home_dir());
     let subfolder_evidence: Vec<AiSubfolderEvidence<'_>> = item
         .subitems
@@ -425,7 +568,7 @@ async fn apply_ai_with_evidence(
         })
         .collect();
 
-    let Some(classification) = ai_client
+    ai_client
         .classify_metadata(
             config,
             resolved_model,
@@ -442,14 +585,20 @@ async fn apply_ai_with_evidence(
             },
         )
         .await
-    else {
-        return;
-    };
+}
 
+fn configured_model_key(config: &AiConfig) -> String {
+    match config.provider {
+        AiProvider::Ollama => config.ollama_model.trim().to_string(),
+        AiProvider::ExternalApi => config.external_model.trim().to_string(),
+        AiProvider::Disabled => String::new(),
+    }
+}
+
+fn apply_classification(item: &mut ScanItem, classification: AiClassification) {
     item.risk = classification.risk;
     item.reason = classification.reason;
     item.ai_classified = true;
-    item.selected = matches!(classification.risk, RiskLevel::Baixo);
 
     for verdict in classification.subfolders {
         if let Some(sub) = item
@@ -468,7 +617,92 @@ async fn apply_ai_with_evidence(
         }
     }
 
+    let has_high_sub = item
+        .subitems
+        .iter()
+        .any(|sub| matches!(sub.risk, RiskLevel::Alto));
+    if has_high_sub {
+        if matches!(item.risk, RiskLevel::Baixo) {
+            item.risk = RiskLevel::Alto;
+        }
+        item.selected = false;
+    } else {
+        item.selected = matches!(item.risk, RiskLevel::Baixo);
+    }
+
     item.cleanable_bytes = compute_cleanable_bytes(item.risk, item.size_bytes, &item.subitems);
+}
+
+fn format_ai_progress(language: AppLanguage, model: &str, count: usize) -> String {
+    match language {
+        AppLanguage::PtBr => format!("IA ({model}) analisando {count} pastas desconhecidas…"),
+        AppLanguage::En => format!("AI ({model}) analyzing {count} unknown folders…"),
+        AppLanguage::Es => format!("IA ({model}) analizando {count} carpetas desconocidas…"),
+    }
+}
+
+fn format_update_offline(language: AppLanguage, current: &str) -> String {
+    match language {
+        AppLanguage::PtBr => {
+            format!("Sem conexão para verificar atualizações. Versão atual: v{current}.")
+        }
+        AppLanguage::En => {
+            format!("Unable to check for updates while offline. Current version: v{current}.")
+        }
+        AppLanguage::Es => {
+            format!("Sin conexión para comprobar actualizaciones. Versión actual: v{current}.")
+        }
+    }
+}
+
+fn format_update_no_releases(language: AppLanguage, current: &str) -> String {
+    match language {
+        AppLanguage::PtBr => {
+            format!("Versão atual v{current} — nenhuma release publicada ainda.")
+        }
+        AppLanguage::En => format!("Current version v{current} — no releases published yet."),
+        AppLanguage::Es => {
+            format!("Versión actual v{current} — aún no hay versiones publicadas.")
+        }
+    }
+}
+
+fn format_update_http_error(language: AppLanguage, status: u16) -> String {
+    match language {
+        AppLanguage::PtBr => format!("Não foi possível verificar atualizações (HTTP {status})."),
+        AppLanguage::En => format!("Could not check for updates (HTTP {status})."),
+        AppLanguage::Es => format!("No se pudo comprobar actualizaciones (HTTP {status})."),
+    }
+}
+
+fn format_update_parse_error(language: AppLanguage, current: &str) -> String {
+    match language {
+        AppLanguage::PtBr => {
+            format!("Erro ao ler resposta de releases. Versão atual: v{current}.")
+        }
+        AppLanguage::En => {
+            format!("Error reading releases response. Current version: v{current}.")
+        }
+        AppLanguage::Es => {
+            format!("Error al leer la respuesta de versiones. Versión actual: v{current}.")
+        }
+    }
+}
+
+fn format_update_available(language: AppLanguage, latest: &str, current: &str) -> String {
+    match language {
+        AppLanguage::PtBr => format!("Nova versão v{latest} disponível (atual: v{current})."),
+        AppLanguage::En => format!("New version v{latest} available (current: v{current})."),
+        AppLanguage::Es => format!("Nueva versión v{latest} disponible (actual: v{current})."),
+    }
+}
+
+fn format_update_up_to_date(language: AppLanguage, current: &str) -> String {
+    match language {
+        AppLanguage::PtBr => format!("Você já está na versão mais recente (v{current})."),
+        AppLanguage::En => format!("You are on the latest version (v{current})."),
+        AppLanguage::Es => format!("Ya tienes la versión más reciente (v{current})."),
+    }
 }
 
 #[must_use]
@@ -505,7 +739,15 @@ fn save_persisted_config(path: &Path, config: &AiConfig) -> Result<(), AppError>
     }
     let payload =
         serde_json::to_vec_pretty(config).map_err(|err| AppError::SettingsIo(err.to_string()))?;
-    let tmp_path = path.with_extension("json.tmp");
+    let seq = CONFIG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        "{}.{}.{seq}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.json"),
+        std::process::id()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
     fs::write(&tmp_path, payload).map_err(|err| AppError::SettingsIo(err.to_string()))?;
     fs::rename(&tmp_path, path).map_err(|err| AppError::SettingsIo(err.to_string()))?;
     Ok(())
@@ -522,5 +764,77 @@ mod tests {
         assert!(is_newer_version("0.9.9", "1.0.0"));
         assert!(!is_newer_version("0.1.0", "0.1.0"));
         assert!(!is_newer_version("0.2.0", "0.1.9"));
+    }
+
+    #[test]
+    fn release_url_validation_blocks_path_traversal() {
+        assert!(is_allowed_release_url(
+            "https://github.com/vicode360/macleaner/releases/tag/v0.1.5"
+        ));
+        assert!(!is_allowed_release_url(
+            "https://github.com/vicode360/macleaner/../../evil/repo"
+        ));
+        assert!(!is_allowed_release_url("http://github.com/vicode360/macleaner/releases"));
+        assert!(!is_allowed_release_url("https://evil.example.com/vicode360/macleaner/"));
+    }
+
+    #[test]
+    fn scan_guard_prevents_concurrent_scans_and_releases_on_drop() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = ScanGuard::try_acquire(&flag).expect("first acquires");
+        assert!(ScanGuard::try_acquire(&flag).is_none());
+        drop(first);
+        assert!(ScanGuard::try_acquire(&flag).is_some());
+    }
+
+    #[test]
+    fn apply_classification_never_selects_parent_with_locked_high_subitem() {
+        let mut item = ScanItem {
+            id: "unclassified:/Users/tester/Library/Application Support/Steam".to_string(),
+            name: "Steam".to_string(),
+            path: "/Users/tester/Library/Application Support/Steam".to_string(),
+            category: "apps".to_string(),
+            size_bytes: 10_000_000,
+            file_count: 100,
+            days_since_modified: 1,
+            risk: RiskLevel::Alto,
+            reason: String::new(),
+            rule_id: None,
+            ai_classified: false,
+            selected: false,
+            subitems: vec![crate::scanner::ScanSubItem {
+                name: "steamapps/common".to_string(),
+                path: "/Users/tester/Library/Application Support/Steam/steamapps/common"
+                    .to_string(),
+                size_bytes: 9_000_000,
+                file_count: 80,
+                days_since_modified: 1,
+                is_dir: true,
+                risk: RiskLevel::Alto,
+                reason: "Jogos instalados.".to_string(),
+                safe_to_clean: false,
+            }],
+            cleanable_bytes: 0,
+            top_extensions: vec![],
+        };
+
+        apply_classification(
+            &mut item,
+            AiClassification {
+                risk: RiskLevel::Baixo,
+                reason: "Hallucinated safe".to_string(),
+                subfolders: vec![crate::ai::AiSubfolderVerdict {
+                    name: "steamapps/common".to_string(),
+                    risk: RiskLevel::Baixo,
+                    reason: "Hallucinated".to_string(),
+                    safe_to_clean: true,
+                }],
+            },
+        );
+
+        assert_eq!(item.risk, RiskLevel::Alto);
+        assert!(!item.selected);
+        assert_eq!(item.subitems[0].risk, RiskLevel::Alto);
+        assert!(!item.subitems[0].safe_to_clean);
     }
 }

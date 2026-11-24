@@ -132,9 +132,16 @@ impl RuleEngine {
     }
 
     #[must_use]
+    pub fn is_protected_normalized(&self, path: &Path) -> bool {
+        if has_relative_components(path) {
+            return self.matches_protected(&normalize_path(path));
+        }
+        self.matches_protected(path)
+    }
+
+    #[must_use]
     pub fn is_protected_path(&self, path: &Path) -> bool {
-        let normalized = normalize_path(path);
-        if self.matches_protected(&normalized) {
+        if self.is_protected_normalized(path) {
             return true;
         }
 
@@ -149,32 +156,70 @@ impl RuleEngine {
 
     #[must_use]
     pub fn classify_path(&self, path: &Path) -> Option<&KnownRule> {
-        let components = lower_path_components(&normalize_path(path));
-        if components.is_empty() {
-            return None;
+        let owned;
+        let target = if has_relative_components(path) {
+            owned = normalize_path(path);
+            owned.as_path()
+        } else {
+            path
+        };
+
+        let last_component = target.components().rev().find_map(|c| match c {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })?;
+
+        let mut best: Option<(usize, &KnownRule)> = None;
+        for rule in &self.rules {
+            for pattern in &rule.patterns {
+                let Some(last_pat) = pattern.last() else {
+                    continue;
+                };
+                if !os_str_eq_lower(last_component, last_pat) {
+                    continue;
+                }
+                if pattern.len() <= best.map_or(0, |(len, _)| len) {
+                    continue;
+                }
+                if path_ends_with_pattern(target, pattern) {
+                    best = Some((pattern.len(), rule));
+                }
+            }
         }
 
-        self.rules
-            .iter()
-            .filter_map(|rule| {
-                rule.patterns
-                    .iter()
-                    .filter(|pattern| components.ends_with(pattern.as_slice()))
-                    .map(|pattern| (pattern.len(), rule))
-                    .max_by_key(|(len, _)| *len)
-            })
-            .max_by_key(|(len, _)| *len)
-            .map(|(_, rule)| rule)
+        best.map(|(_, rule)| rule)
+    }
+
+    #[must_use]
+    pub fn is_protected_or_ancestor(&self, path: &Path) -> bool {
+        let normalized = normalize_path(path);
+        if self.matches_protected(&normalized) || self.matches_protected_ancestor(&normalized) {
+            return true;
+        }
+
+        if let Ok(canonical) = fs::canonicalize(path) {
+            if self.matches_protected(&canonical) || self.matches_protected_ancestor(&canonical) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn matches_protected(&self, candidate: &Path) -> bool {
-        if candidate == Path::new("/") || candidate == self.home_dir {
+        if candidate == Path::new("/") || paths_equal_platform(candidate, &self.home_dir) {
             return true;
         }
 
         self.protected_prefixes
             .iter()
-            .any(|prefix| candidate.starts_with(prefix))
+            .any(|prefix| path_starts_with_platform(candidate, prefix))
+    }
+
+    fn matches_protected_ancestor(&self, candidate: &Path) -> bool {
+        self.protected_prefixes
+            .iter()
+            .any(|prefix| path_starts_with_platform(prefix, candidate))
     }
 }
 
@@ -301,6 +346,27 @@ pub fn classify_subpath(sub_rel_name: &str) -> Option<(RiskLevel, &'static str, 
                     true,
                 ));
             }
+            "cacheddata" | "cachedextensionvsixs" | "crashreporter" => {
+                return Some((
+                    RiskLevel::Baixo,
+                    "Cache temporário ou relatórios de falha recriados pelo app.",
+                    true,
+                ));
+            }
+            "node_modules" | "target" | ".venv" | "deriveddata" => {
+                return Some((
+                    RiskLevel::Baixo,
+                    "Dependências ou artefatos de build regeneráveis pelo projeto.",
+                    true,
+                ));
+            }
+            "ios devicesupport" | "watchos devicesupport" | "tvos devicesupport" => {
+                return Some((
+                    RiskLevel::Baixo,
+                    "Símbolos de depuração antigos do Xcode; recriados ao reconectar o aparelho.",
+                    true,
+                ));
+            }
             _ => {}
         }
     }
@@ -308,20 +374,92 @@ pub fn classify_subpath(sub_rel_name: &str) -> Option<(RiskLevel, &'static str, 
     None
 }
 
+fn has_relative_components(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
+#[cfg(target_os = "macos")]
+fn component_eq_platform(a: Component<'_>, b: Component<'_>) -> bool {
+    match (a, b) {
+        (Component::Normal(sa), Component::Normal(sb)) => {
+            if let (Some(ta), Some(tb)) = (sa.to_str(), sb.to_str()) {
+                if ta.is_ascii() && tb.is_ascii() {
+                    return ta.eq_ignore_ascii_case(tb);
+                }
+                return ta.to_lowercase() == tb.to_lowercase();
+            }
+            sa.to_string_lossy().to_lowercase() == sb.to_string_lossy().to_lowercase()
+        }
+        _ => a == b,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn component_eq_platform(a: Component<'_>, b: Component<'_>) -> bool {
+    a == b
+}
+
+pub(crate) fn path_starts_with_platform(path: &Path, prefix: &Path) -> bool {
+    let mut path_iter = path.components();
+    for pref_comp in prefix.components() {
+        let Some(path_comp) = path_iter.next() else {
+            return false;
+        };
+        if !component_eq_platform(path_comp, pref_comp) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn paths_equal_platform(a: &Path, b: &Path) -> bool {
+    let mut iter_a = a.components();
+    let mut iter_b = b.components();
+    loop {
+        match (iter_a.next(), iter_b.next()) {
+            (Some(ca), Some(cb)) => {
+                if !component_eq_platform(ca, cb) {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn os_str_eq_lower(segment: &std::ffi::OsStr, lower_pat: &str) -> bool {
+    if let Some(s) = segment.to_str() {
+        if s.is_ascii() && lower_pat.is_ascii() {
+            return s.eq_ignore_ascii_case(lower_pat);
+        }
+        return s.to_lowercase() == lower_pat;
+    }
+    segment.to_string_lossy().to_lowercase() == lower_pat
+}
+
+fn path_ends_with_pattern(path: &Path, pattern: &[String]) -> bool {
+    let mut path_iter = path.components().rev().filter_map(|c| match c {
+        Component::Normal(part) => Some(part),
+        _ => None,
+    });
+    for pat in pattern.iter().rev() {
+        let Some(seg) = path_iter.next() else {
+            return false;
+        };
+        if !os_str_eq_lower(seg, pat) {
+            return false;
+        }
+    }
+    true
+}
+
 fn split_pattern_components(pattern: &str) -> Vec<String> {
     pattern
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(str::to_lowercase)
-        .collect()
-}
-
-fn lower_path_components(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
         .collect()
 }
 
@@ -480,5 +618,51 @@ mod tests {
         let userdata = classify_subpath("userdata").expect("userdata");
         assert_eq!(userdata.0, RiskLevel::Alto);
         assert!(!userdata.2);
+    }
+
+    #[test]
+    fn protected_paths_are_case_insensitive_on_macos_and_block_ancestors() {
+        let engine = test_engine();
+        assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/Library")));
+        assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/Library/Application Support")));
+        assert!(engine.is_protected_or_ancestor(Path::new("/Users")));
+        assert!(engine.is_protected_or_ancestor(Path::new("/usr")));
+        assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/.ssh")));
+        assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/Library/Keychains")));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(engine.is_protected_normalized(Path::new("/Users/tester/library/MAIL")));
+            assert!(engine.is_protected_normalized(Path::new(
+                "/Users/tester/Library/Application Support/MOBILESYNC"
+            )));
+        }
+    }
+
+    #[test]
+    fn anchored_rules_do_not_hijack_nested_unrelated_folders() {
+        let engine = test_engine();
+        assert!(engine
+            .classify_path(Path::new(
+                "/Users/tester/Library/Application Support/GameApp/assets/uv"
+            ))
+            .is_none());
+        assert!(engine
+            .classify_path(Path::new(
+                "/Users/tester/Library/Application Support/SomeApp/node_modules/npm"
+            ))
+            .is_none());
+        assert_eq!(
+            engine
+                .classify_path(Path::new("/Users/tester/Library/pnpm/store"))
+                .map(|r| r.id.as_str()),
+            Some("pnpm")
+        );
+        assert_eq!(
+            engine
+                .classify_path(Path::new("/Users/tester/.cache/uv"))
+                .map(|r| r.id.as_str()),
+            Some("uv-cache")
+        );
     }
 }
