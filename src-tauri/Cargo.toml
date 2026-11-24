@@ -1,0 +1,26 @@
+[package]
+name = "macleaner"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "macleaner_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dirs = "6"
+jwalk = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.33", default-features = false, features = ["disk"] }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-http = "2"
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+thiserror = "2"
+toml = "0.8"
+trash = "5"
+window-vibrancy = "0.8.1"

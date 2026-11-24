@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Macleaner</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body data-health="healthy">
+    <main id="app" class="popover-shell">
+      <header class="popover-header">
+        <div class="brand">
+          <span id="brand-icon-slot" class="brand-mark" aria-hidden="true"></span>
+          <h1 translate="no">Macleaner</h1>
+          <span id="version-tag" class="version-tag tabular">v0.1.0</span>
+        </div>
+        <div class="header-actions">
+          <button
+            id="update-header-btn"
+            type="button"
+            class="update-pill"
+            aria-label="Verificar atualizações"
+            title="Verificar atualizações"
+          ></button>
+          <button
+            id="rescan-icon-btn"
+            type="button"
+            class="icon-btn"
+            aria-label="Escanear disco novamente"
+            title="Escanear disco"
+          ></button>
+        </div>
+      </header>
+
+      <nav id="tab-list" class="segmented-control" role="tablist" aria-label="Navegação principal">
+        <button
+          id="tab-resumo"
+          type="button"
+          class="segment-btn is-active"
+          role="tab"
+          aria-selected="true"
+          aria-controls="panel-resumo"
+          data-tab="resumo"
+        ></button>
+        <button
+          id="tab-itens"
+          type="button"
+          class="segment-btn"
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-itens"
+          data-tab="itens"
+        ></button>
+        <button
+          id="tab-ajustes"
+          type="button"
+          class="segment-btn"
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-ajustes"
+          data-tab="ajustes"
+        ></button>
+      </nav>
+
+      <section
+        id="panel-resumo"
+        class="tab-panel is-active"
+        role="tabpanel"
+        aria-labelledby="tab-resumo"
+      ></section>
+
+      <section
+        id="panel-itens"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="tab-itens"
+        hidden
+      ></section>
+
+      <section
+        id="panel-ajustes"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="tab-ajustes"
+        hidden
+      ></section>
+
+      <div id="confirm-bar" class="confirm-bar" role="alertdialog" aria-modal="false" hidden>
+        <p id="confirm-message" class="confirm-message"></p>
+        <div class="confirm-actions">
+          <button id="confirm-cancel-btn" type="button" class="btn btn-ghost btn-xs">Cancelar</button>
+          <button id="confirm-accept-btn" type="button" class="btn btn-danger btn-xs">
+            Mover para Lixeira
+          </button>
+        </div>
+      </div>
+
+      <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

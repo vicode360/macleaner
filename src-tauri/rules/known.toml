@@ -1,0 +1,163 @@
+[protected]
+sip_prefixes = [
+  "/System",
+  "/bin",
+  "/sbin",
+  "/usr/bin",
+  "/usr/lib",
+  "/usr/libexec",
+  "/usr/sbin",
+  "/usr/share",
+  "/Library/Apple",
+  "/private/var/db/SystemPolicyConfiguration",
+]
+
+tcc_user_paths = [
+  "~/Library/Mail",
+  "~/Library/Messages",
+  "~/Library/Safari",
+  "~/Library/Cookies",
+  "~/Library/Accounts",
+  "~/Library/HomeKit",
+  "~/Library/IdentityServices",
+  "~/Library/Metadata/CoreSpotlight",
+  "~/Library/Application Support/AddressBook",
+  "~/Library/Application Support/CallHistoryDB",
+  "~/Library/Application Support/MobileSync",
+  "~/.Trash",
+]
+
+[[rule]]
+id = "xcode-derived-data"
+name = "Xcode DerivedData"
+category = "developer"
+patterns = ["Xcode/DerivedData"]
+risk = "baixo"
+reason = "Artefatos intermediários de build do Xcode recriados na próxima compilação."
+selected_by_default = true
+
+[[rule]]
+id = "coresimulator-caches"
+name = "CoreSimulator Caches"
+category = "developer"
+patterns = ["CoreSimulator/Caches"]
+risk = "baixo"
+reason = "Caches dos simuladores iOS recriados automaticamente pelo Xcode."
+selected_by_default = true
+
+[[rule]]
+id = "homebrew"
+name = "Homebrew Cache"
+category = "developer"
+patterns = ["Homebrew"]
+risk = "baixo"
+reason = "Instaladores e pacotes antigos armazenados em cache pelo Homebrew."
+selected_by_default = true
+
+[[rule]]
+id = "npm"
+name = "npm Cache"
+category = "developer"
+patterns = ["npm", ".npm"]
+risk = "baixo"
+reason = "Cache local de pacotes baixados pelo gerenciador npm."
+selected_by_default = true
+
+[[rule]]
+id = "pnpm"
+name = "pnpm Store & Cache"
+category = "developer"
+patterns = ["pnpm"]
+risk = "baixo"
+reason = "Cache de pacotes mantido pelo pnpm."
+selected_by_default = true
+
+[[rule]]
+id = "cargo-registry"
+name = "Cargo Registry"
+category = "developer"
+patterns = ["Cargo/registry", ".cargo/registry"]
+risk = "baixo"
+reason = "Índice e crates baixados pelo Cargo; restaurados ao compilar."
+selected_by_default = true
+
+[[rule]]
+id = "pip"
+name = "pip Cache"
+category = "developer"
+patterns = ["pip"]
+risk = "baixo"
+reason = "Pacotes Python em cache baixados anteriormente pelo pip."
+selected_by_default = true
+
+[[rule]]
+id = "go-build"
+name = "Go Build Cache"
+category = "developer"
+patterns = ["go-build"]
+risk = "baixo"
+reason = "Cache de compilação incremental do compilador Go."
+selected_by_default = true
+
+[[rule]]
+id = "chrome-cache"
+name = "Google Chrome Cache"
+category = "browser"
+patterns = ["Google/Chrome/Default/Cache"]
+risk = "baixo"
+reason = "Cache de navegação do Chrome recriado automaticamente."
+selected_by_default = true
+
+[[rule]]
+id = "firefox-profiles"
+name = "Firefox Profiles"
+category = "browser"
+patterns = ["Firefox/Profiles"]
+risk = "medio"
+reason = "Perfis e caches do Firefox; revise antes de apagar dados locais."
+selected_by_default = false
+
+[[rule]]
+id = "spotify-data"
+name = "Spotify Data"
+category = "apps"
+patterns = ["Spotify/Data", "com.spotify.client/Data"]
+risk = "baixo"
+reason = "Cache offline de faixas e mídias temporárias do Spotify."
+selected_by_default = true
+
+[[rule]]
+id = "discord-cache"
+name = "Discord Cache"
+category = "apps"
+patterns = ["Discord/Cache"]
+risk = "baixo"
+reason = "Cache de imagens, avatares e mídias carregadas no Discord."
+selected_by_default = true
+
+[[rule]]
+id = "slack-cache"
+name = "Slack Cache"
+category = "apps"
+patterns = ["Slack/Cache"]
+risk = "baixo"
+reason = "Cache local de arquivos e imagens exibidos no Slack."
+selected_by_default = true
+
+[[rule]]
+id = "huggingface-hub"
+name = "Hugging Face Hub"
+category = "ai"
+patterns = ["huggingface/hub"]
+risk = "medio"
+reason = "Modelos e pesos do Hugging Face; removê-los exige novo download."
+selected_by_default = false
+
+[[rule]]
+id = "ollama-models"
+name = "Ollama Models"
+category = "ai"
+patterns = ["ollama/models", ".ollama/models"]
+risk = "medio"
+reason = "Modelos locais do Ollama; removê-los exige novo download."
+selected_by_default = false
