@@ -4,6 +4,7 @@ import {
   ChevronDown,
   ChevronRight,
   Cpu,
+  EyeOff,
   FolderOpen,
   FolderSearch,
   Globe,
@@ -71,6 +72,8 @@ interface AppViewState {
   loadingSnapshots: boolean;
   deletingSnapshots: boolean;
   snapshotsExpanded: boolean;
+  autostartEnabled: boolean;
+  updatingAutostart: boolean;
   aiConfig: AiConfig | null;
   settingsDraft: AiConfig | null;
   installedOllamaModels: string[];
@@ -88,7 +91,7 @@ interface AppViewState {
 
 const state: AppViewState = {
   activeTab: "resumo",
-  appVersion: "0.1.5",
+  appVersion: "0.2.0",
   language: "pt-br",
   updateResult: null,
   checkingUpdate: false,
@@ -101,6 +104,8 @@ const state: AppViewState = {
   loadingSnapshots: false,
   deletingSnapshots: false,
   snapshotsExpanded: false,
+  autostartEnabled: false,
+  updatingAutostart: false,
   aiConfig: null,
   settingsDraft: null,
   installedOllamaModels: [],
@@ -758,6 +763,16 @@ function renderItens(): void {
     });
     actions.append(revealBtn);
 
+    const ignoreBtn = el("button", "btn btn-ghost btn-icon-xs");
+    ignoreBtn.type = "button";
+    ignoreBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+    ignoreBtn.setAttribute("aria-label", copy.items.ignoreAlways);
+    ignoreBtn.title = copy.items.ignoreAlways;
+    ignoreBtn.append(icon(EyeOff, 12));
+    ignoreBtn.addEventListener("click", () => {
+      void ignorePath(item.path, item.name);
+    });
+    actions.append(ignoreBtn);
     const trashBtn = el("button", "btn btn-ghost btn-xs");
     trashBtn.type = "button";
     trashBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
@@ -1077,6 +1092,83 @@ function renderAjustes(): void {
     aiSection.append(el("p", "inline-error", state.settingsError));
   }
 
+  const systemSection = el("section", "aqua-panel");
+  const systemTitle = el("span", "heading-with-icon");
+  systemTitle.append(icon(SlidersHorizontal, 13), el("h2", "section-heading", copy.settings.systemSectionLabel));
+  systemSection.append(systemTitle);
+
+  const autostartRow = el("label", "toggle-row");
+  autostartRow.htmlFor = "autostart-toggle";
+  const autostartInfo = el("span", "toggle-info");
+  autostartInfo.append(
+    el("span", "toggle-title", copy.settings.autostartLabel),
+    el("span", "toggle-hint", copy.settings.autostartHint),
+  );
+  const autostartSwitch = el("input", "toggle-switch");
+  autostartSwitch.id = "autostart-toggle";
+  autostartSwitch.type = "checkbox";
+  autostartSwitch.checked = state.autostartEnabled;
+  autostartSwitch.disabled = state.updatingAutostart;
+  autostartSwitch.addEventListener("change", () => {
+    void toggleAutostart(autostartSwitch.checked);
+  });
+  autostartRow.append(autostartInfo, autostartSwitch);
+
+  const alertRow = el("label", "toggle-row");
+  alertRow.htmlFor = "low-disk-alert-toggle";
+  const alertInfo = el("span", "toggle-info");
+  alertInfo.append(
+    el("span", "toggle-title", copy.settings.lowDiskAlertLabel),
+    el("span", "toggle-hint", copy.settings.lowDiskAlertHint),
+  );
+  const alertSwitch = el("input", "toggle-switch");
+  alertSwitch.id = "low-disk-alert-toggle";
+  alertSwitch.type = "checkbox";
+  alertSwitch.checked = draft.lowDiskAlertEnabled;
+  alertSwitch.addEventListener("change", () => {
+    draft.lowDiskAlertEnabled = alertSwitch.checked;
+    void saveLowDiskAlertPreference(alertSwitch.checked);
+  });
+  alertRow.append(alertInfo, alertSwitch);
+  systemSection.append(autostartRow, alertRow);
+
+  const allowlistSection = el("section", "aqua-panel");
+  const allowlistHead = el("div", "surface-row");
+  const allowlistTitle = el("span", "heading-with-icon");
+  allowlistTitle.append(icon(EyeOff, 13), el("h2", "section-heading", copy.settings.allowlistLabel));
+  allowlistHead.append(
+    allowlistTitle,
+    el("span", "snapshot-count-pill tabular", formatInt(cfg.ignoredPaths.length, state.language)),
+  );
+  allowlistSection.append(allowlistHead);
+
+  if (cfg.ignoredPaths.length === 0) {
+    allowlistSection.append(el("p", "muted", copy.settings.allowlistEmpty));
+  } else {
+    allowlistSection.append(el("p", "muted", copy.settings.allowlistHint));
+    const ignoredList = el("div", "ignored-list");
+    for (const ignoredPath of cfg.ignoredPaths) {
+      const row = el("div", "ignored-row");
+      const info = el("div", "ignored-info");
+      const folderName = ignoredPath.split("/").filter(Boolean).pop() ?? ignoredPath;
+      const nameEl = el("span", "ignored-name", folderName);
+      nameEl.title = ignoredPath;
+      const pathEl = el("span", "ignored-path", ignoredPath);
+      pathEl.title = ignoredPath;
+      info.append(nameEl, pathEl);
+
+      const removeBtn = el("button", "btn btn-ghost btn-xs", copy.settings.allowlistRestore);
+      removeBtn.type = "button";
+      removeBtn.addEventListener("click", () => {
+        void unignorePath(ignoredPath);
+      });
+
+      row.append(info, removeBtn);
+      ignoredList.append(row);
+    }
+    allowlistSection.append(ignoredList);
+  }
+
   const saveBtn = el(
     "button",
     "btn btn-primary",
@@ -1086,7 +1178,7 @@ function renderAjustes(): void {
   saveBtn.disabled = state.savingSettings;
 
   actions.append(detectBtn, saveBtn);
-  form.append(langSection, minSection, aiSection, actions);
+  form.append(langSection, systemSection, minSection, allowlistSection, aiSection, actions);
   panelAjustes.append(form);
 }
 
@@ -1448,6 +1540,92 @@ async function saveLanguagePreference(language: AppLanguage): Promise<void> {
   }
 }
 
+async function saveLowDiskAlertPreference(enabled: boolean): Promise<void> {
+  if (!state.aiConfig) {
+    return;
+  }
+  try {
+    const saved = await invoke<AiConfig>("set_ai_config", {
+      config: { ...state.aiConfig, lowDiskAlertEnabled: enabled },
+    });
+    state.aiConfig = saved;
+    if (state.settingsDraft) {
+      state.settingsDraft.lowDiskAlertEnabled = saved.lowDiskAlertEnabled;
+    }
+  } catch (err) {
+    if (state.settingsDraft) {
+      state.settingsDraft.lowDiskAlertEnabled = state.aiConfig.lowDiskAlertEnabled;
+    }
+    showToast(getCopy(state.language).toasts.updateError(String(err)));
+  } finally {
+    renderAjustes();
+  }
+}
+
+async function toggleAutostart(enabled: boolean): Promise<void> {
+  if (state.updatingAutostart) {
+    return;
+  }
+  state.updatingAutostart = true;
+  renderAjustes();
+
+  try {
+    state.autostartEnabled = await invoke<boolean>("set_autostart_enabled", { enabled });
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.autostartError(String(err)));
+  } finally {
+    state.updatingAutostart = false;
+    renderAjustes();
+  }
+}
+
+async function ignorePath(path: string, displayName: string): Promise<void> {
+  try {
+    const saved = await invoke<AiConfig>("add_ignored_path", { path });
+    state.aiConfig = saved;
+    if (state.settingsDraft) {
+      state.settingsDraft.ignoredPaths = [...saved.ignoredPaths];
+    }
+    if (state.summary) {
+      const remaining = state.summary.items.filter((item) => item.path !== path);
+      for (const item of state.summary.items) {
+        if (item.path === path) {
+          state.expandedItemIds.delete(item.id);
+          if (state.highlightedItemId === item.id) {
+            state.highlightedItemId = null;
+          }
+        }
+      }
+      state.summary = {
+        ...state.summary,
+        items: remaining,
+        itemCount: remaining.length,
+        totalBytes: remaining.reduce((sum, item) => sum + item.sizeBytes, 0),
+        safeBytes: remaining.reduce((sum, item) => sum + item.cleanableBytes, 0),
+      };
+    }
+    showToast(getCopy(state.language).toasts.pathIgnored(displayName));
+    renderActiveTab();
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.ignoreError(String(err)));
+  }
+}
+
+async function unignorePath(path: string): Promise<void> {
+  try {
+    const saved = await invoke<AiConfig>("remove_ignored_path", { path });
+    state.aiConfig = saved;
+    if (state.settingsDraft) {
+      state.settingsDraft.ignoredPaths = [...saved.ignoredPaths];
+    }
+    const label = path.split("/").filter(Boolean).pop() ?? path;
+    showToast(getCopy(state.language).toasts.pathUnignored(label));
+    renderAjustes();
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.ignoreError(String(err)));
+  }
+}
+
 async function saveSettings(draft: AiConfig): Promise<void> {
   state.savingSettings = true;
   state.settingsError = null;
@@ -1572,12 +1750,14 @@ async function init(): Promise<void> {
   state.loadingSnapshots = true;
   renderActiveTab();
 
-  const [versionResult, diskResult, configResult, snapshotResult] = await Promise.allSettled([
-    invoke<string>("get_app_version"),
-    invoke<DiskHealth>("get_disk_health"),
-    invoke<AiConfig>("get_ai_config"),
-    invoke<SnapshotListResult>("list_apfs_snapshots"),
-  ]);
+  const [versionResult, diskResult, configResult, snapshotResult, autostartResult] =
+    await Promise.allSettled([
+      invoke<string>("get_app_version"),
+      invoke<DiskHealth>("get_disk_health"),
+      invoke<AiConfig>("get_ai_config"),
+      invoke<SnapshotListResult>("list_apfs_snapshots"),
+      invoke<boolean>("get_autostart_enabled"),
+    ]);
 
   if (versionResult.status === "fulfilled") {
     state.appVersion = versionResult.value;
@@ -1593,6 +1773,9 @@ async function init(): Promise<void> {
     state.snapshots = snapshotResult.value.snapshots;
     state.snapshotsSupported = snapshotResult.value.supported;
     state.snapshotsNote = snapshotResult.value.note;
+  }
+  if (autostartResult.status === "fulfilled") {
+    state.autostartEnabled = autostartResult.value;
   }
   state.snapshotsLoaded = true;
   state.loadingSnapshots = false;

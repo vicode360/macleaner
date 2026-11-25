@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tauri_plugin_http::reqwest::{self, Url};
 use thiserror::Error;
 
-use crate::rules::{path_starts_with_platform, RiskLevel};
+use crate::rules::{normalize_path, path_starts_with_platform, paths_equal_platform, RiskLevel};
 
 static TMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -78,6 +78,14 @@ pub struct AiConfig {
     pub external_model: String,
     pub external_api_key: String,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
+    #[serde(default = "default_low_disk_alert_enabled")]
+    pub low_disk_alert_enabled: bool,
+}
+
+fn default_low_disk_alert_enabled() -> bool {
+    true
 }
 
 impl fmt::Debug for AiConfig {
@@ -97,6 +105,8 @@ impl fmt::Debug for AiConfig {
             .field("external_model", &self.external_model)
             .field("external_api_key", &masked_key)
             .field("timeout_ms", &self.timeout_ms)
+            .field("ignored_paths", &self.ignored_paths)
+            .field("low_disk_alert_enabled", &self.low_disk_alert_enabled)
             .finish()
     }
 }
@@ -113,10 +123,11 @@ impl Default for AiConfig {
             external_model: DEFAULT_EXTERNAL_MODEL.to_string(),
             external_api_key: String::new(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            ignored_paths: Vec::new(),
+            low_disk_alert_enabled: true,
         }
     }
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiStatus {
@@ -679,6 +690,33 @@ impl AiClient {
         parse_classification_json(&content)
     }
 }
+/// Normalizes, deduplicates, and filters ignored paths to valid absolute paths.
+#[must_use]
+pub fn normalize_ignored_paths(paths: &[String]) -> Vec<String> {
+    let mut normalized: Vec<PathBuf> = Vec::new();
+    for raw in paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(trimmed);
+        if !candidate.is_absolute() {
+            continue;
+        }
+        let norm = normalize_path(candidate);
+        if normalized
+            .iter()
+            .any(|existing| paths_equal_platform(existing, &norm))
+        {
+            continue;
+        }
+        normalized.push(norm);
+    }
+    normalized
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
 
 /// Validates complete AI and scanning configuration before persisting or running queries.
 ///
@@ -847,13 +885,11 @@ fn parse_classification_json(raw: &str) -> Option<AiClassification> {
         .unwrap_or(raw.trim());
     let cleaned = trimmed.strip_suffix("```").unwrap_or(trimmed).trim();
 
-    let parsed: RawAiClassification = serde_json::from_str(cleaned)
-        .ok()
-        .or_else(|| {
-            find_json_objects(cleaned)
-                .into_iter()
-                .find_map(|slice| serde_json::from_str::<RawAiClassification>(slice).ok())
-        })?;
+    let parsed: RawAiClassification = serde_json::from_str(cleaned).ok().or_else(|| {
+        find_json_objects(cleaned)
+            .into_iter()
+            .find_map(|slice| serde_json::from_str::<RawAiClassification>(slice).ok())
+    })?;
     let reason = parsed.reason.trim();
     if reason.is_empty() {
         return None;
@@ -1087,5 +1123,38 @@ mod tests {
         };
         let status = tauri::async_runtime::block_on(client.check_availability(&cfg));
         assert!(!status.available);
+    }
+
+    #[test]
+    fn legacy_config_deserializes_with_defaults_and_normalizes_ignored_paths() {
+        let legacy_json = r#"{
+            "provider": "ollama",
+            "language": "pt-br",
+            "minMb": 25,
+            "ollamaEndpoint": "http://127.0.0.1:11434",
+            "ollamaModel": "auto",
+            "externalEndpoint": "https://api.openai.com/v1/chat/completions",
+            "externalModel": "gpt-4o-mini",
+            "externalApiKey": "",
+            "timeoutMs": 20000
+        }"#;
+        let parsed: AiConfig = serde_json::from_str(legacy_json).expect("legacy json parses");
+        assert!(parsed.ignored_paths.is_empty());
+        assert!(parsed.low_disk_alert_enabled);
+
+        let normalized = normalize_ignored_paths(&[
+            "  /Users/tester/Library/Caches/Steam/  ".to_string(),
+            "/users/tester/library/caches/steam".to_string(),
+            "relative/path".to_string(),
+            String::new(),
+            "/Users/tester/.ollama/models".to_string(),
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                "/Users/tester/Library/Caches/Steam".to_string(),
+                "/Users/tester/.ollama/models".to_string(),
+            ]
+        );
     }
 }

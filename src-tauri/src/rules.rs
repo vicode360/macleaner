@@ -624,7 +624,9 @@ mod tests {
     fn protected_paths_are_case_insensitive_on_macos_and_block_ancestors() {
         let engine = test_engine();
         assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/Library")));
-        assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/Library/Application Support")));
+        assert!(
+            engine.is_protected_or_ancestor(Path::new("/Users/tester/Library/Application Support"))
+        );
         assert!(engine.is_protected_or_ancestor(Path::new("/Users")));
         assert!(engine.is_protected_or_ancestor(Path::new("/usr")));
         assert!(engine.is_protected_or_ancestor(Path::new("/Users/tester/.ssh")));

@@ -68,6 +68,8 @@ export interface AiConfig {
   externalModel: string;
   externalApiKey: string;
   timeoutMs: number;
+  ignoredPaths: string[];
+  lowDiskAlertEnabled: boolean;
 }
 
 export interface AiStatus {
