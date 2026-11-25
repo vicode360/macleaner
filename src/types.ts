@@ -79,14 +79,18 @@ export interface AiStatus {
   model: string;
   reason: string | null;
 }
-
 export interface UpdateCheckResult {
   currentVersion: string;
   latestVersion: string | null;
   updateAvailable: boolean;
-  releaseUrl: string | null;
   message: string;
 }
+
+export type UpdateInstallEvent =
+  | { event: "checking" }
+  | { event: "downloading"; data: { downloadedBytes: number; totalBytes: number | null } }
+  | { event: "installing" }
+  | { event: "restarting" };
 
 export interface TrashFailure {
   path: string;

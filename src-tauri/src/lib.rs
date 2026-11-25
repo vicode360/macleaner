@@ -222,12 +222,17 @@ pub fn run() {
         .manage(PopoverState::default())
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
         ))
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+
             #[cfg(target_os = "macos")]
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -276,7 +281,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_version,
             commands::check_for_updates,
-            commands::open_release_url,
+            commands::install_update,
             commands::get_disk_health,
             commands::reveal_in_finder,
             commands::list_apfs_snapshots,

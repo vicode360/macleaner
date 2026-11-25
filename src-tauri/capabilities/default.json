@@ -9,6 +9,8 @@
     "positioner:allow-move-window",
     "autostart:default",
     "notification:default",
+    "process:default",
+    "updater:default",
     {
       "identifier": "http:default",
       "allow": [

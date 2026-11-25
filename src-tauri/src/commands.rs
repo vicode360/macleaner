@@ -6,13 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_http::reqwest::Url;
+use tauri_plugin_updater::UpdaterExt;
 use thiserror::Error;
 
 use crate::ai::{
@@ -34,10 +33,6 @@ use crate::snapshots::{
 };
 
 const MAX_AI_ITEMS_PER_SCAN: usize = 12;
-const GITHUB_RELEASES_API: &str =
-    "https://api.github.com/repos/vicode360/macleaner/releases/latest";
-const GITHUB_RELEASES_PAGE: &str = "https://github.com/vicode360/macleaner/releases";
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
 static CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,14 +41,24 @@ pub struct UpdateCheckResult {
     pub current_version: String,
     pub latest_version: Option<String>,
     pub update_available: bool,
-    pub release_url: Option<String>,
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubReleasePayload {
-    tag_name: String,
-    html_url: String,
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "event",
+    content = "data"
+)]
+pub enum UpdateInstallEvent {
+    Checking,
+    Downloading {
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    Installing,
+    Restarting,
 }
 
 #[derive(Debug, Error)]
@@ -68,8 +73,8 @@ pub enum AppError {
     HttpInit(String),
     #[error("failed to persist settings: {0}")]
     SettingsIo(String),
-    #[error("invalid release URL")]
-    InvalidReleaseUrl,
+    #[error("update failed: {0}")]
+    Update(String),
     #[error("scan already in progress")]
     ScanInProgress,
     #[error("{0}")]
@@ -164,118 +169,107 @@ pub fn get_app_version() -> String {
 }
 
 #[tauri::command]
-pub async fn check_for_updates(state: State<'_, AppState>) -> Result<UpdateCheckResult, AppError> {
+pub async fn check_for_updates(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UpdateCheckResult, AppError> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let language = state
         .ai_config
         .lock()
         .expect("ai_config lock poisoned")
         .language;
-    let user_agent = format!("Macleaner/{current}");
 
-    let response = match state
-        .ai_client
-        .http_client()
-        .get(GITHUB_RELEASES_API)
-        .header("user-agent", user_agent)
-        .header("accept", "application/vnd.github+json")
-        .timeout(UPDATE_TIMEOUT)
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(_) => {
+    let updater = match app.updater() {
+        Ok(updater) => updater,
+        Err(err) => {
             return Ok(UpdateCheckResult {
                 current_version: current.clone(),
                 latest_version: None,
                 update_available: false,
-                release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-                message: format_update_offline(language, &current),
+                message: format_update_check_error(language, &current, &err.to_string()),
             });
         }
     };
 
-    if response.status().as_u16() == 404 {
-        return Ok(UpdateCheckResult {
+    match updater.check().await {
+        Ok(Some(update)) => {
+            let latest = update
+                .version
+                .trim()
+                .trim_start_matches(['v', 'V'])
+                .to_string();
+            let message = format_update_available(language, &latest, &current);
+            Ok(UpdateCheckResult {
+                current_version: current,
+                latest_version: Some(latest),
+                update_available: true,
+                message,
+            })
+        }
+        Ok(None) => Ok(UpdateCheckResult {
+            current_version: current.clone(),
+            latest_version: Some(current.clone()),
+            update_available: false,
+            message: format_update_up_to_date(language, &current),
+        }),
+        Err(err) => Ok(UpdateCheckResult {
             current_version: current.clone(),
             latest_version: None,
             update_available: false,
-            release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format_update_no_releases(language, &current),
-        });
+            message: format_update_check_error(language, &current, &err.to_string()),
+        }),
     }
-
-    if !response.status().is_success() {
-        return Ok(UpdateCheckResult {
-            current_version: current.clone(),
-            latest_version: None,
-            update_available: false,
-            release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format_update_http_error(language, response.status().as_u16()),
-        });
-    }
-
-    let Ok(bytes) = response.bytes().await else {
-        return Ok(UpdateCheckResult {
-            current_version: current.clone(),
-            latest_version: None,
-            update_available: false,
-            release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format_update_parse_error(language, &current),
-        });
-    };
-
-    let Ok(release) = serde_json::from_slice::<GitHubReleasePayload>(&bytes) else {
-        return Ok(UpdateCheckResult {
-            current_version: current.clone(),
-            latest_version: None,
-            update_available: false,
-            release_url: Some(GITHUB_RELEASES_PAGE.to_string()),
-            message: format_update_parse_error(language, &current),
-        });
-    };
-
-    let latest = release
-        .tag_name
-        .trim()
-        .trim_start_matches(['v', 'V'])
-        .to_string();
-    let update_available = is_newer_version(&current, &latest);
-    let message = if update_available {
-        format_update_available(language, &latest, &current)
-    } else {
-        format_update_up_to_date(language, &current)
-    };
-
-    Ok(UpdateCheckResult {
-        current_version: current,
-        latest_version: Some(latest),
-        update_available,
-        release_url: Some(release.html_url),
-        message,
-    })
 }
 
 #[tauri::command]
-pub fn open_release_url(url: String) -> Result<(), AppError> {
-    if !is_allowed_release_url(&url) {
-        return Err(AppError::InvalidReleaseUrl);
-    }
-    Command::new("open")
-        .arg(&url)
-        .spawn()
-        .map_err(|err| AppError::SettingsIo(err.to_string()))?;
-    Ok(())
-}
+pub async fn install_update(
+    app: tauri::AppHandle,
+    on_event: Channel<UpdateInstallEvent>,
+) -> Result<(), AppError> {
+    let _ = on_event.send(UpdateInstallEvent::Checking);
 
-#[must_use]
-fn is_allowed_release_url(raw: &str) -> bool {
-    let Ok(parsed) = Url::parse(raw.trim()) else {
-        return false;
-    };
-    parsed.scheme() == "https"
-        && parsed.host_str() == Some("github.com")
-        && parsed.path().starts_with("/vicode360/macleaner/")
+    let updater = app
+        .updater()
+        .map_err(|err| AppError::Update(err.to_string()))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|err| AppError::Update(err.to_string()))?
+        .ok_or_else(|| AppError::Update("Nenhuma atualização disponível.".to_string()))?;
+
+    let _ = on_event.send(UpdateInstallEvent::Downloading {
+        downloaded_bytes: 0,
+        total_bytes: None,
+    });
+
+    let mut downloaded_bytes = 0_u64;
+    let mut last_reported = 0_u64;
+    let channel_dl = on_event.clone();
+    let channel_inst = on_event.clone();
+
+    update
+        .download_and_install(
+            move |chunk_len, total_bytes| {
+                downloaded_bytes = downloaded_bytes.saturating_add(chunk_len as u64);
+                let reached_end = total_bytes.is_some_and(|total| downloaded_bytes >= total);
+                if reached_end || downloaded_bytes.saturating_sub(last_reported) >= 64 * 1024 {
+                    last_reported = downloaded_bytes;
+                    let _ = channel_dl.send(UpdateInstallEvent::Downloading {
+                        downloaded_bytes,
+                        total_bytes,
+                    });
+                }
+            },
+            move || {
+                let _ = channel_inst.send(UpdateInstallEvent::Installing);
+            },
+        )
+        .await
+        .map_err(|err| AppError::Update(err.to_string()))?;
+
+    let _ = on_event.send(UpdateInstallEvent::Restarting);
+    app.restart()
 }
 
 #[tauri::command]
@@ -787,50 +781,16 @@ fn format_ai_progress(language: AppLanguage, model: &str, count: usize) -> Strin
     }
 }
 
-fn format_update_offline(language: AppLanguage, current: &str) -> String {
+fn format_update_check_error(language: AppLanguage, current: &str, detail: &str) -> String {
     match language {
         AppLanguage::PtBr => {
-            format!("Sem conexão para verificar atualizações. Versão atual: v{current}.")
+            format!("Não foi possível verificar atualizações (v{current}): {detail}")
         }
         AppLanguage::En => {
-            format!("Unable to check for updates while offline. Current version: v{current}.")
+            format!("Could not check for updates (v{current}): {detail}")
         }
         AppLanguage::Es => {
-            format!("Sin conexión para comprobar actualizaciones. Versión actual: v{current}.")
-        }
-    }
-}
-
-fn format_update_no_releases(language: AppLanguage, current: &str) -> String {
-    match language {
-        AppLanguage::PtBr => {
-            format!("Versão atual v{current} — nenhuma release publicada ainda.")
-        }
-        AppLanguage::En => format!("Current version v{current} — no releases published yet."),
-        AppLanguage::Es => {
-            format!("Versión actual v{current} — aún no hay versiones publicadas.")
-        }
-    }
-}
-
-fn format_update_http_error(language: AppLanguage, status: u16) -> String {
-    match language {
-        AppLanguage::PtBr => format!("Não foi possível verificar atualizações (HTTP {status})."),
-        AppLanguage::En => format!("Could not check for updates (HTTP {status})."),
-        AppLanguage::Es => format!("No se pudo comprobar actualizaciones (HTTP {status})."),
-    }
-}
-
-fn format_update_parse_error(language: AppLanguage, current: &str) -> String {
-    match language {
-        AppLanguage::PtBr => {
-            format!("Erro ao ler resposta de releases. Versão atual: v{current}.")
-        }
-        AppLanguage::En => {
-            format!("Error reading releases response. Current version: v{current}.")
-        }
-        AppLanguage::Es => {
-            format!("Error al leer la respuesta de versiones. Versión actual: v{current}.")
+            format!("No se pudo comprobar actualizaciones (v{current}): {detail}")
         }
     }
 }
@@ -848,24 +808,6 @@ fn format_update_up_to_date(language: AppLanguage, current: &str) -> String {
         AppLanguage::PtBr => format!("Você já está na versão mais recente (v{current})."),
         AppLanguage::En => format!("You are on the latest version (v{current})."),
         AppLanguage::Es => format!("Ya tienes la versión más reciente (v{current})."),
-    }
-}
-
-#[must_use]
-fn is_newer_version(current: &str, latest: &str) -> bool {
-    let parse = |s: &str| -> Option<(u64, u64, u64)> {
-        let clean = s.trim().trim_start_matches(['v', 'V']);
-        let base = clean.split('-').next().unwrap_or(clean);
-        let mut parts = base.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next().unwrap_or("0").parse().ok()?;
-        let patch = parts.next().unwrap_or("0").parse().ok()?;
-        Some((major, minor, patch))
-    };
-
-    match (parse(current), parse(latest)) {
-        (Some(cur), Some(lat)) => lat > cur,
-        _ => false,
     }
 }
 
@@ -905,28 +847,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn semver_comparison_detects_newer_releases() {
-        assert!(is_newer_version("0.1.0", "0.2.0"));
-        assert!(is_newer_version("0.1.0", "v0.1.1"));
-        assert!(is_newer_version("0.9.9", "1.0.0"));
-        assert!(!is_newer_version("0.1.0", "0.1.0"));
-        assert!(!is_newer_version("0.2.0", "0.1.9"));
-    }
-
-    #[test]
-    fn release_url_validation_blocks_path_traversal() {
-        assert!(is_allowed_release_url(
-            "https://github.com/vicode360/macleaner/releases/tag/v0.1.5"
-        ));
-        assert!(!is_allowed_release_url(
-            "https://github.com/vicode360/macleaner/../../evil/repo"
-        ));
-        assert!(!is_allowed_release_url(
-            "http://github.com/vicode360/macleaner/releases"
-        ));
-        assert!(!is_allowed_release_url(
-            "https://evil.example.com/vicode360/macleaner/"
-        ));
+    fn update_install_event_serializes_expected_variants() {
+        let evt = UpdateInstallEvent::Downloading {
+            downloaded_bytes: 512,
+            total_bytes: Some(1024),
+        };
+        let json = serde_json::to_string(&evt).expect("serializes");
+        assert!(json.contains("\"event\":\"downloading\""));
+        assert!(json.contains("\"downloadedBytes\":512"));
+        assert!(json.contains("\"totalBytes\":1024"));
     }
 
     #[test]

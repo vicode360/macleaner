@@ -12,6 +12,9 @@ export interface CopyBundle {
   header: {
     updateIdle: string;
     checkingUpdate: string;
+    installingUpdate: string;
+    downloadingPct: (pct: number) => string;
+    installVersion: (ver: string) => string;
     checkUpdateTitle: string;
     rescanAria: string;
   };
@@ -129,6 +132,8 @@ export interface CopyBundle {
     snapshotsCancelled: string;
     snapshotsError: (err: string) => string;
     updateError: (err: string) => string;
+    updateInstalling: string;
+    updateRestarting: string;
     updateAvailable: (latest: string, current: string) => string;
     updateLatest: (version: string) => string;
     settingsSaved: string;
@@ -155,6 +160,9 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
     header: {
       updateIdle: "Update",
       checkingUpdate: "Checando…",
+      installingUpdate: "Atualizando…",
+      downloadingPct: (pct) => `Baixando ${pct}%…`,
+      installVersion: (ver) => `Instalar v${ver}`,
       checkUpdateTitle: "Verificar atualizações",
       rescanAria: "Escanear disco novamente",
     },
@@ -282,7 +290,9 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
         `${deleted} snapshots removidos (${failed} falharam)`,
       snapshotsCancelled: "Remoção de snapshot cancelada",
       snapshotsError: (err) => `Erro ao remover snapshot APFS: ${err}`,
-      updateError: (err) => `Erro ao verificar atualização: ${err}`,
+      updateError: (err) => `Erro ao atualizar: ${err}`,
+      updateInstalling: "Baixando e instalando atualização…",
+      updateRestarting: "Atualização pronta. Reiniciando Macleaner…",
       updateAvailable: (latest, current) => `Nova versão v${latest} disponível (atual: v${current})`,
       updateLatest: (version) => `Você já está na versão mais recente (v${version})`,
       settingsSaved: "Ajustes salvos",
@@ -307,6 +317,9 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
     header: {
       updateIdle: "Update",
       checkingUpdate: "Checking…",
+      installingUpdate: "Updating…",
+      downloadingPct: (pct) => `Downloading ${pct}%…`,
+      installVersion: (ver) => `Install v${ver}`,
       checkUpdateTitle: "Check for updates",
       rescanAria: "Scan disk again",
     },
@@ -434,7 +447,9 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
         `${deleted} snapshots deleted (${failed} failed)`,
       snapshotsCancelled: "Snapshot deletion canceled",
       snapshotsError: (err) => `Snapshot deletion error: ${err}`,
-      updateError: (err) => `Update check failed: ${err}`,
+      updateError: (err) => `Update failed: ${err}`,
+      updateInstalling: "Downloading and installing update…",
+      updateRestarting: "Update ready. Restarting Macleaner…",
       updateAvailable: (latest, current) => `New version v${latest} available (current: v${current})`,
       updateLatest: (version) => `You're on the latest version (v${version})`,
       settingsSaved: "Settings saved",
@@ -459,6 +474,9 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
     header: {
       updateIdle: "Update",
       checkingUpdate: "Buscando…",
+      installingUpdate: "Actualizando…",
+      downloadingPct: (pct) => `Bajando ${pct}%…`,
+      installVersion: (ver) => `Instalar v${ver}`,
       checkUpdateTitle: "Buscar actualizaciones",
       rescanAria: "Escanear disco de nuevo",
     },
@@ -586,7 +604,9 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
         `${deleted} snapshots eliminados (${failed} fallaron)`,
       snapshotsCancelled: "Eliminación de snapshot cancelada",
       snapshotsError: (err) => `Error al eliminar snapshot APFS: ${err}`,
-      updateError: (err) => `Error al buscar actualizaciones: ${err}`,
+      updateError: (err) => `Error al actualizar: ${err}`,
+      updateInstalling: "Descargando e instalando actualización…",
+      updateRestarting: "Actualización lista. Reiniciando Macleaner…",
       updateAvailable: (latest, current) => `Nueva versión v${latest} disponible (actual: v${current})`,
       updateLatest: (version) => `Ya tienes la versión más reciente (v${version})`,
       settingsSaved: "Ajustes guardados",

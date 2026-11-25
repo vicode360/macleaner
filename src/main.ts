@@ -40,6 +40,7 @@ import type {
   SnapshotListResult,
   TrashResult,
   UpdateCheckResult,
+  UpdateInstallEvent,
 } from "./types";
 
 type TabId = "resumo" | "itens" | "ajustes";
@@ -63,6 +64,8 @@ interface AppViewState {
   language: AppLanguage;
   updateResult: UpdateCheckResult | null;
   checkingUpdate: boolean;
+  installingUpdate: boolean;
+  updateProgressText: string;
   diskHealth: DiskHealth | null;
   summary: ScanSummary | null;
   snapshots: ApfsSnapshot[];
@@ -91,10 +94,12 @@ interface AppViewState {
 
 const state: AppViewState = {
   activeTab: "resumo",
-  appVersion: "0.2.0",
+  appVersion: "0.2.1",
   language: "pt-br",
   updateResult: null,
   checkingUpdate: false,
+  installingUpdate: false,
+  updateProgressText: "",
   diskHealth: null,
   summary: null,
   snapshots: [],
@@ -224,15 +229,23 @@ function updateChrome(): void {
     rescanIconBtn.append(icon(RefreshCw, 14));
   }
 
-  updateHeaderBtn.disabled = state.checkingUpdate;
+  updateHeaderBtn.disabled = state.checkingUpdate || state.installingUpdate;
   updateHeaderBtn.setAttribute("aria-label", copy.header.checkUpdateTitle);
   updateHeaderBtn.replaceChildren(icon(ArrowUpCircle, 12));
-  if (state.checkingUpdate) {
+  if (state.installingUpdate) {
+    updateHeaderBtn.append(
+      document.createTextNode(state.updateProgressText || copy.header.installingUpdate),
+    );
+    updateHeaderBtn.classList.add("has-update");
+    updateHeaderBtn.title = state.updateProgressText || copy.header.installingUpdate;
+  } else if (state.checkingUpdate) {
     updateHeaderBtn.append(document.createTextNode(copy.header.checkingUpdate));
     updateHeaderBtn.classList.remove("has-update");
     updateHeaderBtn.title = copy.header.checkingUpdate;
   } else if (state.updateResult?.updateAvailable && state.updateResult.latestVersion) {
-    updateHeaderBtn.append(document.createTextNode(`v${state.updateResult.latestVersion}`));
+    updateHeaderBtn.append(
+      document.createTextNode(copy.header.installVersion(state.updateResult.latestVersion)),
+    );
     updateHeaderBtn.classList.add("has-update");
     updateHeaderBtn.title = copy.toasts.updateAvailable(
       state.updateResult.latestVersion,
@@ -1495,7 +1508,7 @@ async function executeTrash(paths: string[]): Promise<void> {
 }
 
 async function checkUpdates(): Promise<void> {
-  if (state.checkingUpdate) {
+  if (state.checkingUpdate || state.installingUpdate) {
     return;
   }
   state.checkingUpdate = true;
@@ -1517,6 +1530,46 @@ async function checkUpdates(): Promise<void> {
   } finally {
     state.checkingUpdate = false;
     renderActiveTab();
+  }
+}
+
+async function installUpdate(): Promise<void> {
+  if (state.installingUpdate || state.checkingUpdate) {
+    return;
+  }
+  const copy = getCopy(state.language);
+  state.installingUpdate = true;
+  state.updateProgressText = copy.header.installingUpdate;
+  updateChrome();
+  showToast(copy.toasts.updateInstalling);
+
+  const channel = new Channel<UpdateInstallEvent>();
+  channel.onmessage = (msg) => {
+    const activeCopy = getCopy(state.language);
+    if (msg.event === "downloading") {
+      if (msg.data.totalBytes && msg.data.totalBytes > 0) {
+        const pct = Math.min(100, Math.round((msg.data.downloadedBytes / msg.data.totalBytes) * 100));
+        state.updateProgressText = activeCopy.header.downloadingPct(pct);
+      } else {
+        state.updateProgressText = activeCopy.header.installingUpdate;
+      }
+      updateChrome();
+    } else if (msg.event === "installing") {
+      state.updateProgressText = activeCopy.header.installingUpdate;
+      updateChrome();
+    } else if (msg.event === "restarting") {
+      showToast(activeCopy.toasts.updateRestarting);
+    }
+  };
+
+  try {
+    await invoke("install_update", { onEvent: channel });
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.updateError(String(err)));
+  } finally {
+    state.installingUpdate = false;
+    state.updateProgressText = "";
+    updateChrome();
   }
 }
 
@@ -1703,10 +1756,11 @@ function wireEvents(): void {
   }
 
   updateHeaderBtn.addEventListener("click", () => {
-    if (state.updateResult?.updateAvailable && state.updateResult.releaseUrl) {
-      void invoke("open_release_url", { url: state.updateResult.releaseUrl }).catch((err) => {
-        showToast(getCopy(state.language).toasts.updateError(String(err)));
-      });
+    if (state.installingUpdate || state.checkingUpdate) {
+      return;
+    }
+    if (state.updateResult?.updateAvailable) {
+      void installUpdate();
     } else {
       void checkUpdates();
     }

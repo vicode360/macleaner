@@ -448,11 +448,6 @@ impl AiClient {
         Ok(Self { http })
     }
 
-    #[must_use]
-    pub fn http_client(&self) -> &reqwest::Client {
-        &self.http
-    }
-
     /// Queries the local Ollama daemon for installed model names.
     ///
     /// # Errors
