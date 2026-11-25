@@ -22,7 +22,11 @@ use crate::ai::{
 use crate::rules::{classify_subpath, path_starts_with_platform, paths_equal_platform, RiskLevel, RuleEngine, RuleError};
 use crate::scanner::{
     compute_cleanable_bytes, move_items_to_trash, read_disk_health, sanitize_relative_path,
-    scan_with_engine, summarize_scan, DiskHealth, ScanEvent, ScanItem, ScanSummary, TrashResult,
+    scan_with_engine, summarize_scan, validate_cleanable_target, DiskHealth, ScanEvent, ScanItem,
+    ScanSummary, TrashResult,
+};
+use crate::snapshots::{
+    delete_local_snapshots, list_local_snapshots, SnapshotDeleteResult, SnapshotListResult,
 };
 
 const MAX_AI_ITEMS_PER_SCAN: usize = 12;
@@ -64,6 +68,12 @@ pub enum AppError {
     InvalidReleaseUrl,
     #[error("scan already in progress")]
     ScanInProgress,
+    #[error("{0}")]
+    InvalidRevealPath(String),
+    #[error("failed to reveal item in Finder: {0}")]
+    RevealFailed(String),
+    #[error("failed to manage APFS snapshots: {0}")]
+    SnapshotFailed(String),
 }
 
 impl Serialize for AppError {
@@ -263,6 +273,46 @@ fn is_allowed_release_url(raw: &str) -> bool {
 #[tauri::command]
 pub fn get_disk_health() -> DiskHealth {
     read_disk_health()
+}
+
+#[tauri::command]
+pub async fn reveal_in_finder(path: String, state: State<'_, AppState>) -> Result<(), AppError> {
+    let rules = Arc::clone(&state.rules);
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = validate_cleanable_target(&rules, &path)
+            .map_err(|msg| AppError::InvalidRevealPath(msg.to_string()))?;
+        let status = Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&canonical)
+            .status()
+            .map_err(|err| AppError::RevealFailed(err.to_string()))?;
+        if !status.success() {
+            return Err(AppError::RevealFailed(format!(
+                "open exited with status {status}"
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| AppError::TaskJoin(err.to_string()))?
+}
+
+#[tauri::command]
+pub async fn list_apfs_snapshots() -> Result<SnapshotListResult, AppError> {
+    tauri::async_runtime::spawn_blocking(list_local_snapshots)
+        .await
+        .map_err(|err| AppError::TaskJoin(err.to_string()))?
+        .map_err(AppError::SnapshotFailed)
+}
+
+#[tauri::command]
+pub async fn delete_apfs_snapshots(
+    date_tokens: Vec<String>,
+) -> Result<SnapshotDeleteResult, AppError> {
+    tauri::async_runtime::spawn_blocking(move || delete_local_snapshots(&date_tokens))
+        .await
+        .map_err(|err| AppError::TaskJoin(err.to_string()))?
+        .map_err(AppError::SnapshotFailed)
 }
 
 #[tauri::command]

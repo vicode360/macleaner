@@ -2,6 +2,7 @@ mod ai;
 mod commands;
 mod rules;
 mod scanner;
+mod snapshots;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -135,6 +136,9 @@ pub fn run() {
             commands::check_for_updates,
             commands::open_release_url,
             commands::get_disk_health,
+            commands::reveal_in_finder,
+            commands::list_apfs_snapshots,
+            commands::delete_apfs_snapshots,
             commands::scan_system,
             commands::trash_items,
             commands::check_ai_status,

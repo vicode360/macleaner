@@ -51,12 +51,30 @@ export interface CopyBundle {
     cleanableNote: (size: string) => string;
     subfoldersCount: (count: number) => string;
     hide: string;
+    revealInFinder: string;
     trash: string;
     confirmTrashItem: (name: string, size: string) => string;
     confirmTrashSafe: (count: number, size: string) => string;
     cancel: string;
     moveToTrash: string;
     moving: string;
+  };
+  snapshots: {
+    title: string;
+    refreshAria: string;
+    loading: string;
+    unsupported: string;
+    empty: string;
+    summaryLine: (count: number) => string;
+    hint: string;
+    show: string;
+    hide: string;
+    clearAll: string;
+    remove: string;
+    removing: string;
+    confirmSingle: (date: string) => string;
+    confirmAll: (count: number) => string;
+    confirmAction: string;
   };
   risk: Record<RiskLevel, string>;
   settings: {
@@ -90,6 +108,12 @@ export interface CopyBundle {
     trashPartial: (moved: number, failed: number) => string;
     trashMoved: (size: string) => string;
     trashError: (err: string) => string;
+    revealError: (err: string) => string;
+    snapshotsLoadError: (err: string) => string;
+    snapshotsDeleted: (count: number) => string;
+    snapshotsPartial: (deleted: number, failed: number) => string;
+    snapshotsCancelled: string;
+    snapshotsError: (err: string) => string;
     updateError: (err: string) => string;
     updateAvailable: (latest: string, current: string) => string;
     updateLatest: (version: string) => string;
@@ -156,12 +180,35 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       cleanableNote: (size) => ` · ${size} limpáveis`,
       subfoldersCount: (count) => `Subpastas (${count})`,
       hide: "Ocultar",
+      revealInFinder: "Mostrar no Finder",
       trash: "Lixeira",
       confirmTrashItem: (name, size) => `Mover "${name}" (${size}) para a Lixeira?`,
       confirmTrashSafe: (count, size) => `Mover ${count} itens seguros (${size}) para a Lixeira?`,
       cancel: "Cancelar",
       moveToTrash: "Mover para Lixeira",
       moving: "Movendo…",
+    },
+    snapshots: {
+      title: "Snapshots APFS",
+      refreshAria: "Atualizar snapshots APFS",
+      loading: "Verificando snapshots locais do Time Machine…",
+      unsupported: "Snapshots APFS locais estão disponíveis apenas no macOS.",
+      empty: "Nenhum snapshot local do Time Machine encontrado.",
+      summaryLine: (count) =>
+        count === 1
+          ? "1 snapshot local do Time Machine ocupando Dados do Sistema."
+          : `${count} snapshots locais do Time Machine ocupando Dados do Sistema.`,
+      hint: "Snapshots locais do Time Machine inflam Dados do Sistema. A remoção é permanente.",
+      show: "Ver",
+      hide: "Ocultar",
+      clearAll: "Limpar todos",
+      remove: "Remover",
+      removing: "Removendo…",
+      confirmSingle: (date) =>
+        `Remover permanentemente o snapshot APFS de ${date}? (Não vai para a Lixeira)`,
+      confirmAll: (count) =>
+        `Remover permanentemente ${count} snapshots APFS locais? (Não vão para a Lixeira)`,
+      confirmAction: "Remover Snapshot",
     },
     risk: {
       baixo: "Baixo",
@@ -199,6 +246,14 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       trashPartial: (moved, failed) => `${moved} movidos para a Lixeira (${failed} falharam)`,
       trashMoved: (size) => `${size} movidos para a Lixeira`,
       trashError: (err) => `Erro ao mover para Lixeira: ${err}`,
+      revealError: (err) => `Não foi possível abrir no Finder: ${err}`,
+      snapshotsLoadError: (err) => `Erro ao listar snapshots APFS: ${err}`,
+      snapshotsDeleted: (count) =>
+        count === 1 ? "1 snapshot APFS removido" : `${count} snapshots APFS removidos`,
+      snapshotsPartial: (deleted, failed) =>
+        `${deleted} snapshots removidos (${failed} falharam)`,
+      snapshotsCancelled: "Remoção de snapshot cancelada",
+      snapshotsError: (err) => `Erro ao remover snapshot APFS: ${err}`,
       updateError: (err) => `Erro ao verificar atualização: ${err}`,
       updateAvailable: (latest, current) => `Nova versão v${latest} disponível (atual: v${current})`,
       updateLatest: (version) => `Você já está na versão mais recente (v${version})`,
@@ -263,12 +318,35 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       cleanableNote: (size) => ` · ${size} cleanable`,
       subfoldersCount: (count) => `Subfolders (${count})`,
       hide: "Hide",
+      revealInFinder: "Reveal in Finder",
       trash: "Trash",
       confirmTrashItem: (name, size) => `Move "${name}" (${size}) to Trash?`,
       confirmTrashSafe: (count, size) => `Move ${count} safe items (${size}) to Trash?`,
       cancel: "Cancel",
       moveToTrash: "Move to Trash",
       moving: "Moving…",
+    },
+    snapshots: {
+      title: "APFS Snapshots",
+      refreshAria: "Refresh APFS snapshots",
+      loading: "Checking local Time Machine snapshots…",
+      unsupported: "Local APFS snapshots are only available on macOS.",
+      empty: "No local Time Machine snapshots found.",
+      summaryLine: (count) =>
+        count === 1
+          ? "1 local Time Machine snapshot contributing to System Data."
+          : `${count} local Time Machine snapshots contributing to System Data.`,
+      hint: "Local Time Machine snapshots inflate System Data. Removal is permanent.",
+      show: "View",
+      hide: "Hide",
+      clearAll: "Purge all",
+      remove: "Delete",
+      removing: "Deleting…",
+      confirmSingle: (date) =>
+        `Permanently delete APFS snapshot from ${date}? (Does not go to Trash)`,
+      confirmAll: (count) =>
+        `Permanently delete ${count} local APFS snapshots? (Cannot be undone via Trash)`,
+      confirmAction: "Delete Snapshot",
     },
     risk: {
       baixo: "Low",
@@ -306,6 +384,14 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       trashPartial: (moved, failed) => `${moved} moved to Trash (${failed} failed)`,
       trashMoved: (size) => `${size} moved to Trash`,
       trashError: (err) => `Trash error: ${err}`,
+      revealError: (err) => `Could not reveal in Finder: ${err}`,
+      snapshotsLoadError: (err) => `Failed to list APFS snapshots: ${err}`,
+      snapshotsDeleted: (count) =>
+        count === 1 ? "1 APFS snapshot deleted" : `${count} APFS snapshots deleted`,
+      snapshotsPartial: (deleted, failed) =>
+        `${deleted} snapshots deleted (${failed} failed)`,
+      snapshotsCancelled: "Snapshot deletion canceled",
+      snapshotsError: (err) => `Snapshot deletion error: ${err}`,
       updateError: (err) => `Update check failed: ${err}`,
       updateAvailable: (latest, current) => `New version v${latest} available (current: v${current})`,
       updateLatest: (version) => `You're on the latest version (v${version})`,
@@ -370,12 +456,35 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       cleanableNote: (size) => ` · ${size} limpiables`,
       subfoldersCount: (count) => `Subcarpetas (${count})`,
       hide: "Ocultar",
+      revealInFinder: "Mostrar en Finder",
       trash: "Papelera",
       confirmTrashItem: (name, size) => `¿Mover "${name}" (${size}) a la Papelera?`,
       confirmTrashSafe: (count, size) => `¿Mover ${count} elementos seguros (${size}) a la Papelera?`,
       cancel: "Cancelar",
       moveToTrash: "Mover a la Papelera",
       moving: "Moviendo…",
+    },
+    snapshots: {
+      title: "Snapshots APFS",
+      refreshAria: "Actualizar snapshots APFS",
+      loading: "Comprobando snapshots locales de Time Machine…",
+      unsupported: "Los snapshots APFS locales solo están disponibles en macOS.",
+      empty: "No se encontraron snapshots locales de Time Machine.",
+      summaryLine: (count) =>
+        count === 1
+          ? "1 snapshot local de Time Machine ocupando Datos del Sistema."
+          : `${count} snapshots locales de Time Machine ocupando Datos del Sistema.`,
+      hint: "Los snapshots locales inflan Datos del Sistema. Su eliminación es permanente.",
+      show: "Ver",
+      hide: "Ocultar",
+      clearAll: "Limpiar todos",
+      remove: "Eliminar",
+      removing: "Eliminando…",
+      confirmSingle: (date) =>
+        `¿Eliminar permanentemente el snapshot APFS de ${date}? (No va a la Papelera)`,
+      confirmAll: (count) =>
+        `¿Eliminar permanentemente ${count} snapshots APFS locales? (No van a la Papelera)`,
+      confirmAction: "Eliminar Snapshot",
     },
     risk: {
       baixo: "Bajo",
@@ -413,6 +522,14 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       trashPartial: (moved, failed) => `${moved} movidos a la Papelera (${failed} fallaron)`,
       trashMoved: (size) => `${size} movidos a la Papelera`,
       trashError: (err) => `Error al mover a la Papelera: ${err}`,
+      revealError: (err) => `No se pudo abrir en Finder: ${err}`,
+      snapshotsLoadError: (err) => `Error al listar snapshots APFS: ${err}`,
+      snapshotsDeleted: (count) =>
+        count === 1 ? "1 snapshot APFS eliminado" : `${count} snapshots APFS eliminados`,
+      snapshotsPartial: (deleted, failed) =>
+        `${deleted} snapshots eliminados (${failed} fallaron)`,
+      snapshotsCancelled: "Eliminación de snapshot cancelada",
+      snapshotsError: (err) => `Error al eliminar snapshot APFS: ${err}`,
       updateError: (err) => `Error al buscar actualizaciones: ${err}`,
       updateAvailable: (latest, current) => `Nueva versión v${latest} disponible (actual: v${current})`,
       updateLatest: (version) => `Ya tienes la versión más reciente (v${version})`,
@@ -464,4 +581,27 @@ export function formatDays(days: number, lang: AppLanguage): string {
     return copy.days.oneDay;
   }
   return copy.days.nDays(formatInt(days, lang));
+}
+
+export function formatSnapshotTimestamp(iso: string, lang: AppLanguage): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return iso;
+  }
+  return new Intl.DateTimeFormat(getCopy(lang).locale, {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+export function formatSnapshotAge(iso: string, lang: AppLanguage): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const diffDays = Math.max(0, Math.floor((Date.now() - date.getTime()) / 86_400_000));
+  return formatDays(diffDays, lang);
 }
