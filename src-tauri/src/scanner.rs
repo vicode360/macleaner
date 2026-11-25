@@ -376,25 +376,55 @@ pub(crate) fn default_direct_targets(home_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn is_ignored_path(candidate: &Path, ignored_paths: &[PathBuf]) -> bool {
+    ignored_paths
+        .iter()
+        .any(|ignored| path_starts_with_platform(candidate, ignored))
+}
+
+#[cfg(test)]
 pub(crate) fn scan_with_engine(
     engine: &RuleEngine,
     min_mb: u64,
     on_event: &(impl Fn(ScanEvent) + Sync),
 ) -> RawScanOutput {
+    scan_with_engine_and_ignored(engine, &[], min_mb, on_event)
+}
+
+pub(crate) fn scan_with_engine_and_ignored(
+    engine: &RuleEngine,
+    ignored_paths: &[PathBuf],
+    min_mb: u64,
+    on_event: &(impl Fn(ScanEvent) + Sync),
+) -> RawScanOutput {
     let roots = default_scan_roots(engine.home_dir());
     let direct_targets = default_direct_targets(engine.home_dir());
-    scan_roots_and_direct(engine, &roots, &direct_targets, min_mb, on_event)
+    scan_roots_and_direct(
+        engine,
+        &roots,
+        &direct_targets,
+        ignored_paths,
+        min_mb,
+        on_event,
+    )
 }
 
 pub(crate) fn scan_roots_and_direct(
     engine: &RuleEngine,
     roots: &[PathBuf],
     direct_targets: &[PathBuf],
+    ignored_paths: &[PathBuf],
     min_mb: u64,
     on_event: &(impl Fn(ScanEvent) + Sync),
 ) -> RawScanOutput {
     let started_at = Instant::now();
     let min_bytes = min_mb.saturating_mul(BYTES_PER_MIB);
+    let normalized_ignored = Arc::new(
+        ignored_paths
+            .iter()
+            .map(|path| normalize_path(path))
+            .collect::<Vec<_>>(),
+    );
 
     let active_roots: Vec<PathBuf> = roots
         .iter()
@@ -402,6 +432,7 @@ pub(crate) fn scan_roots_and_direct(
         .filter(|root| {
             fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_dir())
                 && !engine.is_protected_path(root)
+                && !is_ignored_path(root, &normalized_ignored)
         })
         .collect();
 
@@ -411,6 +442,7 @@ pub(crate) fn scan_roots_and_direct(
         .filter(|target| {
             fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_dir())
                 && !engine.is_protected_path(target)
+                && !is_ignored_path(target, &normalized_ignored)
                 && !active_roots
                     .iter()
                     .any(|root| path_starts_with_platform(target, root))
@@ -432,6 +464,7 @@ pub(crate) fn scan_roots_and_direct(
                     scan_single_root(
                         engine,
                         root,
+                        Arc::clone(&normalized_ignored),
                         Arc::clone(&skipped_counter),
                         Arc::clone(&scanned_bytes_counter),
                         on_event,
@@ -446,6 +479,7 @@ pub(crate) fn scan_roots_and_direct(
                     let stats = scan_direct_target(
                         engine,
                         target,
+                        Arc::clone(&normalized_ignored),
                         Arc::clone(&skipped_counter),
                         Arc::clone(&scanned_bytes_counter),
                         on_event,
@@ -526,8 +560,8 @@ pub(crate) fn summarize_scan(
 
 fn is_within_cleanable_scope(engine: &RuleEngine, candidate: &Path) -> bool {
     let resolved = fs::canonicalize(candidate).unwrap_or_else(|_| normalize_path(candidate));
-    let home = fs::canonicalize(engine.home_dir())
-        .unwrap_or_else(|_| normalize_path(engine.home_dir()));
+    let home =
+        fs::canonicalize(engine.home_dir()).unwrap_or_else(|_| normalize_path(engine.home_dir()));
 
     if !path_starts_with_platform(&resolved, &home) || paths_equal_platform(&resolved, &home) {
         return false;
@@ -554,6 +588,27 @@ fn is_within_cleanable_scope(engine: &RuleEngine, candidate: &Path) -> bool {
     false
 }
 
+pub(crate) fn validate_cleanable_target(
+    engine: &RuleEngine,
+    raw_path: &str,
+) -> Result<PathBuf, &'static str> {
+    let candidate = Path::new(raw_path);
+    if !candidate.is_absolute() || engine.is_protected_or_ancestor(candidate) {
+        return Err("Caminho protegido pela política do sistema.");
+    }
+
+    let meta = fs::symlink_metadata(candidate).map_err(|_| "Item não encontrado no disco.")?;
+    if meta.file_type().is_symlink() {
+        return Err("Caminho protegido pela política do sistema.");
+    }
+
+    if !is_within_cleanable_scope(engine, candidate) {
+        return Err("Caminho protegido pela política do sistema.");
+    }
+
+    fs::canonicalize(candidate).map_err(|_| "Item não encontrado no disco.")
+}
+
 pub(crate) fn move_items_to_trash(
     engine: &RuleEngine,
     paths: &[String],
@@ -572,46 +627,10 @@ pub(crate) fn move_items_to_trash(
     let mut accepted_paths: Vec<PathBuf> = Vec::new();
 
     for (raw_path, normalized) in normalized_inputs {
-        let candidate = Path::new(&raw_path);
-        if !candidate.is_absolute() {
+        if let Err(reason) = validate_cleanable_target(engine, &raw_path) {
             failed_paths.push(TrashFailure {
                 path: raw_path,
-                reason: "Caminho protegido pela política do sistema.".to_string(),
-            });
-            continue;
-        }
-
-        if engine.is_protected_or_ancestor(candidate) {
-            failed_paths.push(TrashFailure {
-                path: raw_path,
-                reason: "Caminho protegido pela política do sistema.".to_string(),
-            });
-            continue;
-        }
-
-        let meta = match fs::symlink_metadata(candidate) {
-            Ok(meta) => meta,
-            Err(_) => {
-                failed_paths.push(TrashFailure {
-                    path: raw_path,
-                    reason: "Item não encontrado no disco.".to_string(),
-                });
-                continue;
-            }
-        };
-
-        if meta.file_type().is_symlink() {
-            failed_paths.push(TrashFailure {
-                path: raw_path,
-                reason: "Caminho protegido pela política do sistema.".to_string(),
-            });
-            continue;
-        }
-
-        if !is_within_cleanable_scope(engine, candidate) {
-            failed_paths.push(TrashFailure {
-                path: raw_path,
-                reason: "Caminho protegido pela política do sistema.".to_string(),
+                reason: reason.to_string(),
             });
             continue;
         }
@@ -623,7 +642,7 @@ pub(crate) fn move_items_to_trash(
             continue;
         }
 
-        match trash::delete(candidate) {
+        match trash::delete(Path::new(&raw_path)) {
             Ok(()) => {
                 freed_bytes =
                     freed_bytes.saturating_add(known_sizes.get(&raw_path).copied().unwrap_or(0));
@@ -698,6 +717,7 @@ fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
 fn scan_single_root(
     engine: &RuleEngine,
     root: &Path,
+    ignored_paths: Arc<Vec<PathBuf>>,
     skipped_counter: Arc<AtomicU64>,
     scanned_bytes_counter: Arc<AtomicU64>,
     on_event: &(impl Fn(ScanEvent) + Sync),
@@ -735,10 +755,12 @@ fn scan_single_root(
                     return false;
                 }
 
-                if engine_ref.is_protected_normalized(&entry.path()) {
+                let entry_path = entry.path();
+                if engine_ref.is_protected_normalized(&entry_path)
+                    || is_ignored_path(&entry_path, &ignored_paths)
+                {
                     return false;
                 }
-
                 if entry.file_type().is_file() {
                     let Some(bucket) = current_bucket else {
                         return false;
@@ -824,6 +846,7 @@ fn scan_single_root(
 fn scan_direct_target(
     engine: &RuleEngine,
     target: &Path,
+    ignored_paths: Arc<Vec<PathBuf>>,
     skipped_counter: Arc<AtomicU64>,
     scanned_bytes_counter: Arc<AtomicU64>,
     on_event: &(impl Fn(ScanEvent) + Sync),
@@ -852,7 +875,9 @@ fn scan_direct_target(
                     return false;
                 }
 
-                !engine_ref.is_protected_normalized(&entry.path())
+                let entry_path = entry.path();
+                !engine_ref.is_protected_normalized(&entry_path)
+                    && !is_ignored_path(&entry_path, &ignored_paths)
             });
         });
 
@@ -1402,5 +1427,57 @@ mod tests {
         assert_eq!(output.items.len(), 1);
         assert_eq!(output.items[0].file_count, 2000);
         assert_eq!(output.items[0].size_bytes, 2000 * 1024);
+    }
+
+    #[test]
+    fn validate_cleanable_target_accepts_scanned_subpath_and_blocks_escapes() {
+        let root = unique_temp_dir("reveal_scope");
+        let cache_dir = root.join("Library/Caches/DemoApp/sub");
+        let desktop_file = root.join("Desktop/secret.txt");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::create_dir_all(desktop_file.parent().expect("desktop parent"))
+            .expect("create desktop dir");
+        fs::write(&desktop_file, b"keep").expect("write desktop");
+        let link = root.join("Library/Caches/escape_link");
+        std::os::unix::fs::symlink(&desktop_file, &link).expect("create symlink");
+
+        let engine =
+            RuleEngine::from_toml_str(include_str!("../rules/known.toml"), &root).expect("parse");
+
+        let ok = validate_cleanable_target(&engine, &cache_dir.to_string_lossy());
+        let err_desktop = validate_cleanable_target(&engine, &desktop_file.to_string_lossy());
+        let err_link = validate_cleanable_target(&engine, &link.to_string_lossy());
+        let err_system = validate_cleanable_target(&engine, "/System/Library");
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(ok.is_ok());
+        assert!(err_desktop.is_err());
+        assert!(err_link.is_err());
+        assert!(err_system.is_err());
+    }
+
+    #[test]
+    fn scanner_prunes_allowlisted_folders_and_subfolders() {
+        let root = unique_temp_dir("allowlist_prune");
+        let steam = root.join("Library/Application Support/Steam");
+        let steam_common = steam.join("steamapps/common");
+        let slack = root.join("Library/Application Support/Slack/Cache");
+        let brew = root.join("Library/Caches/Homebrew");
+
+        for dir in [&steam_common, &slack, &brew] {
+            fs::create_dir_all(dir).expect("create test dirs");
+        }
+        fs::write(steam_common.join("game.bin"), vec![0_u8; 3 * 1024 * 1024]).expect("write steam");
+        fs::write(slack.join("cache.bin"), vec![0_u8; 2 * 1024 * 1024]).expect("write slack");
+        fs::write(brew.join("pkg.tar"), vec![0_u8; 2 * 1024 * 1024]).expect("write brew");
+
+        let engine =
+            RuleEngine::from_toml_str(include_str!("../rules/known.toml"), &root).expect("parse");
+        let ignored = vec![steam.clone(), slack.clone()];
+        let output = scan_with_engine_and_ignored(&engine, &ignored, 1, &|_| {});
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(output.items.len(), 1);
+        assert_eq!(output.items[0].rule_id.as_deref(), Some("homebrew"));
     }
 }

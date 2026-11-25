@@ -68,6 +68,8 @@ export interface AiConfig {
   externalModel: string;
   externalApiKey: string;
   timeoutMs: number;
+  ignoredPaths: string[];
+  lowDiskAlertEnabled: boolean;
 }
 
 export interface AiStatus {
@@ -95,6 +97,30 @@ export interface TrashResult {
   trashedPaths: string[];
   failedPaths: TrashFailure[];
   freedBytes: number;
+}
+
+export interface ApfsSnapshot {
+  id: string;
+  dateToken: string;
+  timestampIso: string;
+  volume: string;
+}
+
+export interface SnapshotListResult {
+  snapshots: ApfsSnapshot[];
+  supported: boolean;
+  note: string | null;
+}
+
+export interface SnapshotDeleteFailure {
+  dateToken: string;
+  reason: string;
+}
+
+export interface SnapshotDeleteResult {
+  deletedTokens: string[];
+  failed: SnapshotDeleteFailure[];
+  cancelled: boolean;
 }
 
 export type ScanEvent =

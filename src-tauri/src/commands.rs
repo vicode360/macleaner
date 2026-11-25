@@ -11,18 +11,26 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_http::reqwest::Url;
 use thiserror::Error;
 
 use crate::ai::{
-    validate_config, AiCacheKey, AiClassification, AiClassificationCache, AiClient, AiConfig,
-    AiError, AiExtensionEvidence, AiMetadataInput, AiProvider, AiStatus, AiSubfolderEvidence,
-    AppLanguage,
+    normalize_ignored_paths, validate_config, AiCacheKey, AiClassification, AiClassificationCache,
+    AiClient, AiConfig, AiError, AiExtensionEvidence, AiMetadataInput, AiProvider, AiStatus,
+    AiSubfolderEvidence, AppLanguage,
 };
-use crate::rules::{classify_subpath, path_starts_with_platform, paths_equal_platform, RiskLevel, RuleEngine, RuleError};
+use crate::rules::{
+    classify_subpath, normalize_path, path_starts_with_platform, paths_equal_platform, RiskLevel,
+    RuleEngine, RuleError,
+};
 use crate::scanner::{
     compute_cleanable_bytes, move_items_to_trash, read_disk_health, sanitize_relative_path,
-    scan_with_engine, summarize_scan, DiskHealth, ScanEvent, ScanItem, ScanSummary, TrashResult,
+    scan_with_engine_and_ignored, summarize_scan, validate_cleanable_target, DiskHealth, ScanEvent,
+    ScanItem, ScanSummary, TrashResult,
+};
+use crate::snapshots::{
+    delete_local_snapshots, list_local_snapshots, SnapshotDeleteResult, SnapshotListResult,
 };
 
 const MAX_AI_ITEMS_PER_SCAN: usize = 12;
@@ -64,6 +72,14 @@ pub enum AppError {
     InvalidReleaseUrl,
     #[error("scan already in progress")]
     ScanInProgress,
+    #[error("{0}")]
+    InvalidRevealPath(String),
+    #[error("failed to reveal item in Finder: {0}")]
+    RevealFailed(String),
+    #[error("failed to manage APFS snapshots: {0}")]
+    SnapshotFailed(String),
+    #[error("failed to update launch at login: {0}")]
+    Autostart(String),
 }
 
 impl Serialize for AppError {
@@ -104,6 +120,7 @@ pub struct AppState {
     pub(crate) ai_cache_path: Option<PathBuf>,
     pub(crate) last_sizes: Mutex<HashMap<String, u64>>,
     pub(crate) scan_in_progress: Arc<AtomicBool>,
+    pub(crate) low_disk_notified: AtomicBool,
 }
 
 impl AppState {
@@ -136,6 +153,7 @@ impl AppState {
             ai_cache_path,
             last_sizes: Mutex::new(HashMap::new()),
             scan_in_progress: Arc::new(AtomicBool::new(false)),
+            low_disk_notified: AtomicBool::new(false),
         })
     }
 }
@@ -261,13 +279,60 @@ fn is_allowed_release_url(raw: &str) -> bool {
 }
 
 #[tauri::command]
-pub fn get_disk_health() -> DiskHealth {
+pub fn get_disk_health(app: tauri::AppHandle) -> DiskHealth {
+    crate::sync_tray_disk_status(&app);
     read_disk_health()
+}
+
+#[tauri::command]
+pub async fn reveal_in_finder(path: String, state: State<'_, AppState>) -> Result<(), AppError> {
+    let rules = Arc::clone(&state.rules);
+    tauri::async_runtime::spawn_blocking(move || {
+        let canonical = validate_cleanable_target(&rules, &path)
+            .map_err(|msg| AppError::InvalidRevealPath(msg.to_string()))?;
+        let status = Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&canonical)
+            .status()
+            .map_err(|err| AppError::RevealFailed(err.to_string()))?;
+        if !status.success() {
+            return Err(AppError::RevealFailed(format!(
+                "open exited with status {status}"
+            )));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| AppError::TaskJoin(err.to_string()))?
+}
+
+#[tauri::command]
+pub async fn list_apfs_snapshots() -> Result<SnapshotListResult, AppError> {
+    tauri::async_runtime::spawn_blocking(list_local_snapshots)
+        .await
+        .map_err(|err| AppError::TaskJoin(err.to_string()))?
+        .map_err(AppError::SnapshotFailed)
+}
+
+#[tauri::command]
+pub async fn delete_apfs_snapshots(
+    date_tokens: Vec<String>,
+    app: tauri::AppHandle,
+) -> Result<SnapshotDeleteResult, AppError> {
+    let result = tauri::async_runtime::spawn_blocking(move || delete_local_snapshots(&date_tokens))
+        .await
+        .map_err(|err| AppError::TaskJoin(err.to_string()))?
+        .map_err(AppError::SnapshotFailed)?;
+    if !result.deleted_tokens.is_empty() {
+        crate::sync_tray_disk_status(&app);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn scan_system(
     min_mb: Option<u64>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     on_event: Channel<ScanEvent>,
 ) -> Result<ScanSummary, AppError> {
@@ -280,18 +345,22 @@ pub async fn scan_system(
         .expect("ai_config lock poisoned")
         .clone();
     let threshold_mb = min_mb.unwrap_or(ai_config.min_mb);
+    let ignored_paths: Vec<PathBuf> = ai_config
+        .ignored_paths
+        .iter()
+        .map(|raw| normalize_path(Path::new(raw)))
+        .collect();
 
     let rules = Arc::clone(&state.rules);
     let event_channel = on_event.clone();
 
     let mut raw = tauri::async_runtime::spawn_blocking(move || {
-        scan_with_engine(&rules, threshold_mb, &|event| {
+        scan_with_engine_and_ignored(&rules, &ignored_paths, threshold_mb, &|event| {
             let _ = event_channel.send(event);
         })
     })
     .await
     .map_err(|err| AppError::TaskJoin(err.to_string()))?;
-
     let mut ai_available = false;
     let mut uncached_unknown_count = 0_usize;
     let cache_model = configured_model_key(&ai_config);
@@ -432,7 +501,6 @@ pub async fn scan_system(
             }
         }
     }
-
     let summary = summarize_scan(
         raw.items,
         raw.skipped_permission_count,
@@ -442,6 +510,7 @@ pub async fn scan_system(
     let _ = on_event.send(ScanEvent::Finished {
         summary: summary.clone(),
     });
+    crate::sync_tray_disk_status(&app);
 
     Ok(summary)
 }
@@ -449,6 +518,7 @@ pub async fn scan_system(
 #[tauri::command]
 pub async fn trash_items(
     paths: Vec<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<TrashResult, AppError> {
     let rules = Arc::clone(&state.rules);
@@ -492,6 +562,7 @@ pub async fn trash_items(
         if let Some(ref cache_path) = state.ai_cache_path {
             let _ = cache_snapshot.save(cache_path);
         }
+        crate::sync_tray_disk_status(&app);
     }
 
     Ok(result)
@@ -529,14 +600,89 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, AppError> {
 }
 
 #[tauri::command]
-pub fn set_ai_config(config: AiConfig, state: State<'_, AppState>) -> Result<AiConfig, AppError> {
+pub fn set_ai_config(
+    mut config: AiConfig,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AiConfig, AppError> {
+    config.ignored_paths = normalize_ignored_paths(&config.ignored_paths);
     validate_config(&config)?;
     if let Some(ref path) = state.config_path {
         save_persisted_config(path, &config)?;
     }
-    let mut guard = state.ai_config.lock().expect("ai_config lock poisoned");
-    *guard = config.clone();
+    {
+        let mut guard = state.ai_config.lock().expect("ai_config lock poisoned");
+        *guard = config.clone();
+    }
+    crate::sync_tray_disk_status(&app);
     Ok(config)
+}
+
+#[tauri::command]
+pub fn add_ignored_path(path: String, state: State<'_, AppState>) -> Result<AiConfig, AppError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !Path::new(trimmed).is_absolute() {
+        return Err(AppError::InvalidRevealPath(
+            "Caminho inválido para ignorar.".to_string(),
+        ));
+    }
+
+    let updated = {
+        let mut guard = state.ai_config.lock().expect("ai_config lock poisoned");
+        let mut next = guard.clone();
+        next.ignored_paths.push(trimmed.to_string());
+        next.ignored_paths = normalize_ignored_paths(&next.ignored_paths);
+        if let Some(ref cfg_path) = state.config_path {
+            save_persisted_config(cfg_path, &next)?;
+        }
+        *guard = next.clone();
+        next
+    };
+
+    Ok(updated)
+}
+
+#[tauri::command]
+pub fn remove_ignored_path(path: String, state: State<'_, AppState>) -> Result<AiConfig, AppError> {
+    let target = normalize_path(Path::new(path.trim()));
+    let updated = {
+        let mut guard = state.ai_config.lock().expect("ai_config lock poisoned");
+        let mut next = guard.clone();
+        next.ignored_paths
+            .retain(|entry| !paths_equal_platform(Path::new(entry), &target));
+        next.ignored_paths = normalize_ignored_paths(&next.ignored_paths);
+        if let Some(ref cfg_path) = state.config_path {
+            save_persisted_config(cfg_path, &next)?;
+        }
+        *guard = next.clone();
+        next
+    };
+
+    Ok(updated)
+}
+
+#[tauri::command]
+pub fn get_autostart_enabled(app: tauri::AppHandle) -> Result<bool, AppError> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|err| AppError::Autostart(err.to_string()))
+}
+
+#[tauri::command]
+pub fn set_autostart_enabled(enabled: bool, app: tauri::AppHandle) -> Result<bool, AppError> {
+    let manager = app.autolaunch();
+    if enabled {
+        manager
+            .enable()
+            .map_err(|err| AppError::Autostart(err.to_string()))?;
+    } else {
+        manager
+            .disable()
+            .map_err(|err| AppError::Autostart(err.to_string()))?;
+    }
+    manager
+        .is_enabled()
+        .map_err(|err| AppError::Autostart(err.to_string()))
 }
 
 async fn query_ai_with_evidence(
@@ -729,6 +875,7 @@ fn load_persisted_config(path: &Path) -> Option<AiConfig> {
     if parsed.timeout_ms < 15_000 {
         parsed.timeout_ms = 20_000;
     }
+    parsed.ignored_paths = normalize_ignored_paths(&parsed.ignored_paths);
     validate_config(&parsed).ok()?;
     Some(parsed)
 }
@@ -774,8 +921,12 @@ mod tests {
         assert!(!is_allowed_release_url(
             "https://github.com/vicode360/macleaner/../../evil/repo"
         ));
-        assert!(!is_allowed_release_url("http://github.com/vicode360/macleaner/releases"));
-        assert!(!is_allowed_release_url("https://evil.example.com/vicode360/macleaner/"));
+        assert!(!is_allowed_release_url(
+            "http://github.com/vicode360/macleaner/releases"
+        ));
+        assert!(!is_allowed_release_url(
+            "https://evil.example.com/vicode360/macleaner/"
+        ));
     }
 
     #[test]

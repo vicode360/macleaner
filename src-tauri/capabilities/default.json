@@ -7,6 +7,8 @@
   "permissions": [
     "core:default",
     "positioner:allow-move-window",
+    "autostart:default",
+    "notification:default",
     {
       "identifier": "http:default",
       "allow": [

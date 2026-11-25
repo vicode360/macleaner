@@ -4,9 +4,12 @@ import {
   ChevronDown,
   ChevronRight,
   Cpu,
+  EyeOff,
+  FolderOpen,
   FolderSearch,
   Globe,
   HardDrive,
+  History,
   RefreshCw,
   ScanSearch,
   SlidersHorizontal,
@@ -15,16 +18,26 @@ import {
   createElement,
   type IconNode,
 } from "lucide";
-import { formatBytes, formatDays, formatInt, getCopy } from "./i18n";
+import {
+  formatBytes,
+  formatDays,
+  formatInt,
+  formatSnapshotAge,
+  formatSnapshotTimestamp,
+  getCopy,
+} from "./i18n";
 import type {
   AiConfig,
   AiProvider,
+  ApfsSnapshot,
   AppLanguage,
   DiskHealth,
   RiskLevel,
   ScanEvent,
   ScanItem,
   ScanSummary,
+  SnapshotDeleteResult,
+  SnapshotListResult,
   TrashResult,
   UpdateCheckResult,
 } from "./types";
@@ -32,10 +45,17 @@ import type {
 type TabId = "resumo" | "itens" | "ajustes";
 type RiskFilter = "todos" | RiskLevel;
 
-interface PendingTrashAction {
-  paths: string[];
-  getLabel: () => string;
-}
+type PendingConfirmAction =
+  | {
+      kind: "trash";
+      paths: string[];
+      getLabel: () => string;
+    }
+  | {
+      kind: "snapshot";
+      dateTokens: string[];
+      getLabel: () => string;
+    };
 
 interface AppViewState {
   activeTab: TabId;
@@ -45,6 +65,15 @@ interface AppViewState {
   checkingUpdate: boolean;
   diskHealth: DiskHealth | null;
   summary: ScanSummary | null;
+  snapshots: ApfsSnapshot[];
+  snapshotsLoaded: boolean;
+  snapshotsSupported: boolean;
+  snapshotsNote: string | null;
+  loadingSnapshots: boolean;
+  deletingSnapshots: boolean;
+  snapshotsExpanded: boolean;
+  autostartEnabled: boolean;
+  updatingAutostart: boolean;
   aiConfig: AiConfig | null;
   settingsDraft: AiConfig | null;
   installedOllamaModels: string[];
@@ -54,7 +83,7 @@ interface AppViewState {
   trashing: boolean;
   riskFilter: RiskFilter;
   highlightedItemId: string | null;
-  pendingConfirm: PendingTrashAction | null;
+  pendingConfirm: PendingConfirmAction | null;
   settingsError: string | null;
   detectingModels: boolean;
   savingSettings: boolean;
@@ -62,12 +91,21 @@ interface AppViewState {
 
 const state: AppViewState = {
   activeTab: "resumo",
-  appVersion: "0.1.5",
+  appVersion: "0.2.0",
   language: "pt-br",
   updateResult: null,
   checkingUpdate: false,
   diskHealth: null,
   summary: null,
+  snapshots: [],
+  snapshotsLoaded: false,
+  snapshotsSupported: true,
+  snapshotsNote: null,
+  loadingSnapshots: false,
+  deletingSnapshots: false,
+  snapshotsExpanded: false,
+  autostartEnabled: false,
+  updatingAutostart: false,
   aiConfig: null,
   settingsDraft: null,
   installedOllamaModels: [],
@@ -162,7 +200,7 @@ function setActiveTab(tab: TabId): void {
   panelResumo.hidden = tab !== "resumo";
   panelItens.hidden = tab !== "itens";
   panelAjustes.hidden = tab !== "ajustes";
-  if (tab === "ajustes" && !state.trashing) {
+  if (tab === "ajustes" && !state.trashing && !state.deletingSnapshots) {
     state.pendingConfirm = null;
   }
   renderActiveTab();
@@ -178,7 +216,7 @@ function updateChrome(): void {
   }
 
   versionTag.textContent = `v${state.appVersion}`;
-  rescanIconBtn.disabled = state.scanning || state.trashing;
+  rescanIconBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
   rescanIconBtn.classList.toggle("is-spinning", state.scanning);
   rescanIconBtn.setAttribute("aria-label", copy.header.rescanAria);
   rescanIconBtn.title = copy.summary.scanDisk;
@@ -234,13 +272,21 @@ function updateConfirmBar(): void {
     confirmAcceptBtn.replaceChildren(icon(Trash2, 12), document.createTextNode(copy.items.moveToTrash));
     return;
   }
+
+  const isSnapshot = state.pendingConfirm.kind === "snapshot";
+  const inProgress = isSnapshot ? state.deletingSnapshots : state.trashing;
+  const actionLabel = isSnapshot
+    ? inProgress
+      ? copy.snapshots.removing
+      : copy.snapshots.confirmAction
+    : inProgress
+      ? copy.items.moving
+      : copy.items.moveToTrash;
+
   confirmMessage.textContent = state.pendingConfirm.getLabel();
-  confirmAcceptBtn.disabled = state.trashing || state.scanning;
-  confirmCancelBtn.disabled = state.trashing;
-  confirmAcceptBtn.replaceChildren(
-    icon(Trash2, 12),
-    document.createTextNode(state.trashing ? copy.items.moving : copy.items.moveToTrash),
-  );
+  confirmAcceptBtn.disabled = state.trashing || state.deletingSnapshots || state.scanning;
+  confirmCancelBtn.disabled = state.trashing || state.deletingSnapshots;
+  confirmAcceptBtn.replaceChildren(icon(Trash2, 12), document.createTextNode(actionLabel));
   confirmBar.hidden = false;
 }
 
@@ -358,7 +404,7 @@ function renderResumo(): void {
   const actionRow = el("div", "action-row");
   const scanBtn = el("button", "btn btn-primary");
   scanBtn.type = "button";
-  scanBtn.disabled = state.scanning || state.trashing;
+  scanBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
   scanBtn.append(
     icon(ScanSearch, 14),
     document.createTextNode(
@@ -378,7 +424,7 @@ function renderResumo(): void {
   if (safeTargets.paths.length > 0 && !state.scanning) {
     const cleanSafeBtn = el("button", "btn btn-secondary tabular");
     cleanSafeBtn.type = "button";
-    cleanSafeBtn.disabled = state.trashing;
+    cleanSafeBtn.disabled = state.trashing || state.deletingSnapshots;
     cleanSafeBtn.append(
       icon(Trash2, 13),
       document.createTextNode(copy.summary.cleanSafeCount(safeTargets.paths.length)),
@@ -390,7 +436,7 @@ function renderResumo(): void {
   }
 
   scanSection.append(scanHead, figures, scanDesc, actionRow);
-  panelResumo.append(diskSection, scanSection);
+  panelResumo.append(diskSection, scanSection, buildSnapshotsSection());
 
   if (state.summary && state.summary.items.length > 0) {
     const villainsSection = el("section", "aqua-panel");
@@ -431,6 +477,132 @@ function renderResumo(): void {
     villainsSection.append(villainsHead, list);
     panelResumo.append(villainsSection);
   }
+}
+
+function buildSnapshotsSection(): HTMLElement {
+  const copy = getCopy(state.language);
+  const section = el("section", "aqua-panel snapshots-panel");
+
+  const head = el("div", "surface-row");
+  const titleWrap = el("div", "heading-with-icon");
+  titleWrap.append(icon(History, 14), el("h2", "section-heading", copy.snapshots.title));
+
+  if (state.snapshotsLoaded && state.snapshotsSupported) {
+    const count = state.snapshots.length;
+    const pillClass = count > 0 ? "snapshot-count-pill has-items tabular" : "snapshot-count-pill tabular";
+    titleWrap.append(el("span", pillClass, formatInt(count, state.language)));
+  }
+
+  const headActions = el("div", "snapshot-head-actions");
+
+  const refreshBtn = el("button", "btn btn-ghost btn-icon-xs");
+  refreshBtn.type = "button";
+  refreshBtn.disabled = state.loadingSnapshots || state.deletingSnapshots;
+  refreshBtn.classList.toggle("is-spinning", state.loadingSnapshots);
+  refreshBtn.setAttribute("aria-label", copy.snapshots.refreshAria);
+  refreshBtn.title = copy.snapshots.refreshAria;
+  refreshBtn.append(icon(RefreshCw, 11));
+  refreshBtn.addEventListener("click", () => {
+    void refreshSnapshots(false);
+  });
+  headActions.append(refreshBtn);
+
+  if (state.snapshotsSupported && state.snapshots.length > 0) {
+    const toggleBtn = el("button", "btn btn-ghost btn-xs");
+    toggleBtn.type = "button";
+    toggleBtn.setAttribute("aria-expanded", String(state.snapshotsExpanded));
+    toggleBtn.append(
+      icon(state.snapshotsExpanded ? ChevronDown : ChevronRight, 11),
+      document.createTextNode(state.snapshotsExpanded ? copy.snapshots.hide : copy.snapshots.show),
+    );
+    toggleBtn.addEventListener("click", () => {
+      state.snapshotsExpanded = !state.snapshotsExpanded;
+      renderResumo();
+    });
+    headActions.append(toggleBtn);
+  }
+
+  head.append(titleWrap, headActions);
+  section.append(head);
+
+  if (!state.snapshotsLoaded && state.loadingSnapshots) {
+    section.append(el("p", "muted", copy.snapshots.loading));
+    return section;
+  }
+
+  if (!state.snapshotsSupported) {
+    section.append(el("p", "muted", state.snapshotsNote ?? copy.snapshots.unsupported));
+    return section;
+  }
+
+  if (state.snapshots.length === 0) {
+    section.append(el("p", "muted", copy.snapshots.empty));
+    return section;
+  }
+
+  if (!state.snapshotsExpanded) {
+    section.append(el("p", "muted", copy.snapshots.summaryLine(state.snapshots.length)));
+    return section;
+  }
+
+  section.append(el("p", "muted", copy.snapshots.hint));
+
+  const list = el("div", "snapshots-list");
+  for (const snap of state.snapshots) {
+    const row = el("div", "snapshot-row");
+    const info = el("div", "snapshot-info");
+    const formattedDate = formatSnapshotTimestamp(snap.timestampIso, state.language);
+    const age = formatSnapshotAge(snap.timestampIso, state.language);
+
+    const dateEl = el("span", "snapshot-date tabular", formattedDate);
+    dateEl.title = snap.id;
+    info.append(dateEl);
+    if (age) {
+      info.append(el("span", "snapshot-meta", `${age} · ${snap.volume}`));
+    }
+
+    const delBtn = el("button", "btn btn-ghost btn-xs");
+    delBtn.type = "button";
+    delBtn.disabled = state.deletingSnapshots || state.trashing || state.scanning;
+    delBtn.append(icon(Trash2, 11), document.createTextNode(copy.snapshots.remove));
+    delBtn.addEventListener("click", () => {
+      state.pendingConfirm = {
+        kind: "snapshot",
+        dateTokens: [snap.dateToken],
+        getLabel: () =>
+          getCopy(state.language).snapshots.confirmSingle(
+            formatSnapshotTimestamp(snap.timestampIso, state.language),
+          ),
+      };
+      updateConfirmBar();
+    });
+
+    row.append(info, delBtn);
+    list.append(row);
+  }
+
+  section.append(list);
+
+  if (state.snapshots.length > 1) {
+    const footerRow = el("div", "snapshot-footer");
+    const clearAllBtn = el("button", "btn btn-secondary btn-xs");
+    clearAllBtn.type = "button";
+    clearAllBtn.disabled = state.deletingSnapshots || state.trashing || state.scanning;
+    clearAllBtn.append(icon(Trash2, 11), document.createTextNode(copy.snapshots.clearAll));
+    clearAllBtn.addEventListener("click", () => {
+      const tokens = state.snapshots.map((snap) => snap.dateToken);
+      state.pendingConfirm = {
+        kind: "snapshot",
+        dateTokens: tokens,
+        getLabel: () => getCopy(state.language).snapshots.confirmAll(tokens.length),
+      };
+      updateConfirmBar();
+    });
+    footerRow.append(clearAllBtn);
+    section.append(footerRow);
+  }
+
+  return section;
 }
 
 function renderItens(): void {
@@ -485,7 +657,7 @@ function renderItens(): void {
   if (safeTargets.paths.length > 0) {
     const cleanAllBtn = el("button", "btn btn-secondary btn-xs");
     cleanAllBtn.type = "button";
-    cleanAllBtn.disabled = state.scanning || state.trashing;
+    cleanAllBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
     cleanAllBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.cleanSafe));
     cleanAllBtn.addEventListener("click", () => {
       requestCleanSafeTargets();
@@ -580,12 +752,34 @@ function renderItens(): void {
       actions.append(expandBtn);
     }
 
+    const revealBtn = el("button", "btn btn-ghost btn-icon-xs");
+    revealBtn.type = "button";
+    revealBtn.disabled = state.trashing || state.deletingSnapshots;
+    revealBtn.setAttribute("aria-label", copy.items.revealInFinder);
+    revealBtn.title = copy.items.revealInFinder;
+    revealBtn.append(icon(FolderOpen, 12));
+    revealBtn.addEventListener("click", () => {
+      void revealInFinder(item.path);
+    });
+    actions.append(revealBtn);
+
+    const ignoreBtn = el("button", "btn btn-ghost btn-icon-xs");
+    ignoreBtn.type = "button";
+    ignoreBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+    ignoreBtn.setAttribute("aria-label", copy.items.ignoreAlways);
+    ignoreBtn.title = copy.items.ignoreAlways;
+    ignoreBtn.append(icon(EyeOff, 12));
+    ignoreBtn.addEventListener("click", () => {
+      void ignorePath(item.path, item.name);
+    });
+    actions.append(ignoreBtn);
     const trashBtn = el("button", "btn btn-ghost btn-xs");
     trashBtn.type = "button";
-    trashBtn.disabled = state.scanning || state.trashing;
+    trashBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
     trashBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.trash));
     trashBtn.addEventListener("click", () => {
       state.pendingConfirm = {
+        kind: "trash",
         paths: [item.path],
         getLabel: () =>
           getCopy(state.language).items.confirmTrashItem(
@@ -625,12 +819,26 @@ function renderItens(): void {
           ),
         );
 
+        const subActions = el("div", "subitem-actions");
+
+        const subRevealBtn = el("button", "btn btn-ghost btn-icon-xs");
+        subRevealBtn.type = "button";
+        subRevealBtn.disabled = state.trashing || state.deletingSnapshots;
+        subRevealBtn.setAttribute("aria-label", copy.items.revealInFinder);
+        subRevealBtn.title = copy.items.revealInFinder;
+        subRevealBtn.append(icon(FolderOpen, 11));
+        subRevealBtn.addEventListener("click", () => {
+          void revealInFinder(sub.path);
+        });
+        subActions.append(subRevealBtn);
+
         const subTrashBtn = el("button", "btn btn-ghost btn-xs");
         subTrashBtn.type = "button";
-        subTrashBtn.disabled = state.scanning || state.trashing;
+        subTrashBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
         subTrashBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.trash));
         subTrashBtn.addEventListener("click", () => {
           state.pendingConfirm = {
+            kind: "trash",
             paths: [sub.path],
             getLabel: () =>
               getCopy(state.language).items.confirmTrashItem(
@@ -640,7 +848,9 @@ function renderItens(): void {
           };
           updateConfirmBar();
         });
-        subBottom.append(subTrashBtn);
+        subActions.append(subTrashBtn);
+
+        subBottom.append(subActions);
 
         subRow.append(subTop, subBottom);
         subPanel.append(subRow);
@@ -882,6 +1092,83 @@ function renderAjustes(): void {
     aiSection.append(el("p", "inline-error", state.settingsError));
   }
 
+  const systemSection = el("section", "aqua-panel");
+  const systemTitle = el("span", "heading-with-icon");
+  systemTitle.append(icon(SlidersHorizontal, 13), el("h2", "section-heading", copy.settings.systemSectionLabel));
+  systemSection.append(systemTitle);
+
+  const autostartRow = el("label", "toggle-row");
+  autostartRow.htmlFor = "autostart-toggle";
+  const autostartInfo = el("span", "toggle-info");
+  autostartInfo.append(
+    el("span", "toggle-title", copy.settings.autostartLabel),
+    el("span", "toggle-hint", copy.settings.autostartHint),
+  );
+  const autostartSwitch = el("input", "toggle-switch");
+  autostartSwitch.id = "autostart-toggle";
+  autostartSwitch.type = "checkbox";
+  autostartSwitch.checked = state.autostartEnabled;
+  autostartSwitch.disabled = state.updatingAutostart;
+  autostartSwitch.addEventListener("change", () => {
+    void toggleAutostart(autostartSwitch.checked);
+  });
+  autostartRow.append(autostartInfo, autostartSwitch);
+
+  const alertRow = el("label", "toggle-row");
+  alertRow.htmlFor = "low-disk-alert-toggle";
+  const alertInfo = el("span", "toggle-info");
+  alertInfo.append(
+    el("span", "toggle-title", copy.settings.lowDiskAlertLabel),
+    el("span", "toggle-hint", copy.settings.lowDiskAlertHint),
+  );
+  const alertSwitch = el("input", "toggle-switch");
+  alertSwitch.id = "low-disk-alert-toggle";
+  alertSwitch.type = "checkbox";
+  alertSwitch.checked = draft.lowDiskAlertEnabled;
+  alertSwitch.addEventListener("change", () => {
+    draft.lowDiskAlertEnabled = alertSwitch.checked;
+    void saveLowDiskAlertPreference(alertSwitch.checked);
+  });
+  alertRow.append(alertInfo, alertSwitch);
+  systemSection.append(autostartRow, alertRow);
+
+  const allowlistSection = el("section", "aqua-panel");
+  const allowlistHead = el("div", "surface-row");
+  const allowlistTitle = el("span", "heading-with-icon");
+  allowlistTitle.append(icon(EyeOff, 13), el("h2", "section-heading", copy.settings.allowlistLabel));
+  allowlistHead.append(
+    allowlistTitle,
+    el("span", "snapshot-count-pill tabular", formatInt(cfg.ignoredPaths.length, state.language)),
+  );
+  allowlistSection.append(allowlistHead);
+
+  if (cfg.ignoredPaths.length === 0) {
+    allowlistSection.append(el("p", "muted", copy.settings.allowlistEmpty));
+  } else {
+    allowlistSection.append(el("p", "muted", copy.settings.allowlistHint));
+    const ignoredList = el("div", "ignored-list");
+    for (const ignoredPath of cfg.ignoredPaths) {
+      const row = el("div", "ignored-row");
+      const info = el("div", "ignored-info");
+      const folderName = ignoredPath.split("/").filter(Boolean).pop() ?? ignoredPath;
+      const nameEl = el("span", "ignored-name", folderName);
+      nameEl.title = ignoredPath;
+      const pathEl = el("span", "ignored-path", ignoredPath);
+      pathEl.title = ignoredPath;
+      info.append(nameEl, pathEl);
+
+      const removeBtn = el("button", "btn btn-ghost btn-xs", copy.settings.allowlistRestore);
+      removeBtn.type = "button";
+      removeBtn.addEventListener("click", () => {
+        void unignorePath(ignoredPath);
+      });
+
+      row.append(info, removeBtn);
+      ignoredList.append(row);
+    }
+    allowlistSection.append(ignoredList);
+  }
+
   const saveBtn = el(
     "button",
     "btn btn-primary",
@@ -891,7 +1178,7 @@ function renderAjustes(): void {
   saveBtn.disabled = state.savingSettings;
 
   actions.append(detectBtn, saveBtn);
-  form.append(langSection, minSection, aiSection, actions);
+  form.append(langSection, systemSection, minSection, allowlistSection, aiSection, actions);
   panelAjustes.append(form);
 }
 
@@ -955,6 +1242,7 @@ function requestCleanSafeTargets(): void {
     return;
   }
   state.pendingConfirm = {
+    kind: "trash",
     paths: safeTargets.paths,
     getLabel: () =>
       getCopy(state.language).items.confirmTrashSafe(
@@ -963,6 +1251,78 @@ function requestCleanSafeTargets(): void {
       ),
   };
   updateConfirmBar();
+}
+
+async function revealInFinder(path: string): Promise<void> {
+  try {
+    await invoke("reveal_in_finder", { path });
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.revealError(String(err)));
+  }
+}
+
+async function refreshSnapshots(silent: boolean): Promise<void> {
+  if (state.loadingSnapshots) {
+    return;
+  }
+  state.loadingSnapshots = true;
+  if (state.activeTab === "resumo") {
+    renderResumo();
+  }
+
+  try {
+    const result = await invoke<SnapshotListResult>("list_apfs_snapshots");
+    state.snapshots = result.snapshots;
+    state.snapshotsSupported = result.supported;
+    state.snapshotsNote = result.note;
+    state.snapshotsLoaded = true;
+    if (result.snapshots.length === 0) {
+      state.snapshotsExpanded = false;
+    }
+  } catch (err) {
+    state.snapshotsLoaded = true;
+    if (!silent) {
+      showToast(getCopy(state.language).toasts.snapshotsLoadError(String(err)));
+    }
+  } finally {
+    state.loadingSnapshots = false;
+    if (state.activeTab === "resumo") {
+      renderResumo();
+    }
+  }
+}
+
+async function executeDeleteSnapshots(dateTokens: string[]): Promise<void> {
+  if (state.deletingSnapshots || state.trashing || state.scanning || dateTokens.length === 0) {
+    state.pendingConfirm = null;
+    updateConfirmBar();
+    return;
+  }
+
+  state.deletingSnapshots = true;
+  renderActiveTab();
+
+  try {
+    const result = await invoke<SnapshotDeleteResult>("delete_apfs_snapshots", { dateTokens });
+    await Promise.allSettled([refreshSnapshots(true), refreshDiskHealth()]);
+
+    const toasts = getCopy(state.language).toasts;
+    if (result.cancelled && result.deletedTokens.length === 0) {
+      showToast(toasts.snapshotsCancelled);
+    } else if (result.failed.length > 0 && result.deletedTokens.length === 0) {
+      showToast(toasts.snapshotsError(result.failed[0].reason));
+    } else if (result.failed.length > 0) {
+      showToast(toasts.snapshotsPartial(result.deletedTokens.length, result.failed.length));
+    } else if (result.deletedTokens.length > 0) {
+      showToast(toasts.snapshotsDeleted(result.deletedTokens.length));
+    }
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.snapshotsError(String(err)));
+  } finally {
+    state.deletingSnapshots = false;
+    state.pendingConfirm = null;
+    renderActiveTab();
+  }
 }
 
 async function refreshDiskHealth(): Promise<void> {
@@ -974,7 +1334,7 @@ async function refreshDiskHealth(): Promise<void> {
 }
 
 async function runScan(): Promise<void> {
-  if (state.scanning || state.trashing) {
+  if (state.scanning || state.trashing || state.deletingSnapshots) {
     return;
   }
   const copy = getCopy(state.language);
@@ -1010,9 +1370,10 @@ async function runScan(): Promise<void> {
     if (state.highlightedItemId && !validIds.has(state.highlightedItemId)) {
       state.highlightedItemId = null;
     }
-    const [diskResult, configResult] = await Promise.allSettled([
+    const [diskResult, configResult, snapshotResult] = await Promise.allSettled([
       invoke<DiskHealth>("get_disk_health"),
       invoke<AiConfig>("get_ai_config"),
+      invoke<SnapshotListResult>("list_apfs_snapshots"),
     ]);
     if (diskResult.status === "fulfilled") {
       state.diskHealth = diskResult.value;
@@ -1020,6 +1381,12 @@ async function runScan(): Promise<void> {
     if (configResult.status === "fulfilled") {
       state.aiConfig = configResult.value;
       state.language = configResult.value.language;
+    }
+    if (snapshotResult.status === "fulfilled") {
+      state.snapshots = snapshotResult.value.snapshots;
+      state.snapshotsSupported = snapshotResult.value.supported;
+      state.snapshotsNote = snapshotResult.value.note;
+      state.snapshotsLoaded = true;
     }
     showToast(
       getCopy(state.language).toasts.scanComplete(formatBytes(summary.totalBytes, state.language)),
@@ -1044,7 +1411,7 @@ function recomputeItemCleanableBytes(item: ScanItem): number {
 }
 
 async function executeTrash(paths: string[]): Promise<void> {
-  if (state.trashing || state.scanning || paths.length === 0) {
+  if (state.trashing || state.deletingSnapshots || state.scanning || paths.length === 0) {
     state.pendingConfirm = null;
     updateConfirmBar();
     return;
@@ -1173,6 +1540,92 @@ async function saveLanguagePreference(language: AppLanguage): Promise<void> {
   }
 }
 
+async function saveLowDiskAlertPreference(enabled: boolean): Promise<void> {
+  if (!state.aiConfig) {
+    return;
+  }
+  try {
+    const saved = await invoke<AiConfig>("set_ai_config", {
+      config: { ...state.aiConfig, lowDiskAlertEnabled: enabled },
+    });
+    state.aiConfig = saved;
+    if (state.settingsDraft) {
+      state.settingsDraft.lowDiskAlertEnabled = saved.lowDiskAlertEnabled;
+    }
+  } catch (err) {
+    if (state.settingsDraft) {
+      state.settingsDraft.lowDiskAlertEnabled = state.aiConfig.lowDiskAlertEnabled;
+    }
+    showToast(getCopy(state.language).toasts.updateError(String(err)));
+  } finally {
+    renderAjustes();
+  }
+}
+
+async function toggleAutostart(enabled: boolean): Promise<void> {
+  if (state.updatingAutostart) {
+    return;
+  }
+  state.updatingAutostart = true;
+  renderAjustes();
+
+  try {
+    state.autostartEnabled = await invoke<boolean>("set_autostart_enabled", { enabled });
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.autostartError(String(err)));
+  } finally {
+    state.updatingAutostart = false;
+    renderAjustes();
+  }
+}
+
+async function ignorePath(path: string, displayName: string): Promise<void> {
+  try {
+    const saved = await invoke<AiConfig>("add_ignored_path", { path });
+    state.aiConfig = saved;
+    if (state.settingsDraft) {
+      state.settingsDraft.ignoredPaths = [...saved.ignoredPaths];
+    }
+    if (state.summary) {
+      const remaining = state.summary.items.filter((item) => item.path !== path);
+      for (const item of state.summary.items) {
+        if (item.path === path) {
+          state.expandedItemIds.delete(item.id);
+          if (state.highlightedItemId === item.id) {
+            state.highlightedItemId = null;
+          }
+        }
+      }
+      state.summary = {
+        ...state.summary,
+        items: remaining,
+        itemCount: remaining.length,
+        totalBytes: remaining.reduce((sum, item) => sum + item.sizeBytes, 0),
+        safeBytes: remaining.reduce((sum, item) => sum + item.cleanableBytes, 0),
+      };
+    }
+    showToast(getCopy(state.language).toasts.pathIgnored(displayName));
+    renderActiveTab();
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.ignoreError(String(err)));
+  }
+}
+
+async function unignorePath(path: string): Promise<void> {
+  try {
+    const saved = await invoke<AiConfig>("remove_ignored_path", { path });
+    state.aiConfig = saved;
+    if (state.settingsDraft) {
+      state.settingsDraft.ignoredPaths = [...saved.ignoredPaths];
+    }
+    const label = path.split("/").filter(Boolean).pop() ?? path;
+    showToast(getCopy(state.language).toasts.pathUnignored(label));
+    renderAjustes();
+  } catch (err) {
+    showToast(getCopy(state.language).toasts.ignoreError(String(err)));
+  }
+}
+
 async function saveSettings(draft: AiConfig): Promise<void> {
   state.savingSettings = true;
   state.settingsError = null;
@@ -1269,13 +1722,23 @@ function wireEvents(): void {
   });
 
   confirmAcceptBtn.addEventListener("click", () => {
-    if (state.pendingConfirm) {
+    if (!state.pendingConfirm) {
+      return;
+    }
+    if (state.pendingConfirm.kind === "trash") {
       void executeTrash(state.pendingConfirm.paths);
+    } else {
+      void executeDeleteSnapshots(state.pendingConfirm.dateTokens);
     }
   });
 
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && state.pendingConfirm && !state.trashing) {
+    if (
+      event.key === "Escape" &&
+      state.pendingConfirm &&
+      !state.trashing &&
+      !state.deletingSnapshots
+    ) {
       state.pendingConfirm = null;
       updateConfirmBar();
     }
@@ -1284,13 +1747,17 @@ function wireEvents(): void {
 
 async function init(): Promise<void> {
   wireEvents();
+  state.loadingSnapshots = true;
   renderActiveTab();
 
-  const [versionResult, diskResult, configResult] = await Promise.allSettled([
-    invoke<string>("get_app_version"),
-    invoke<DiskHealth>("get_disk_health"),
-    invoke<AiConfig>("get_ai_config"),
-  ]);
+  const [versionResult, diskResult, configResult, snapshotResult, autostartResult] =
+    await Promise.allSettled([
+      invoke<string>("get_app_version"),
+      invoke<DiskHealth>("get_disk_health"),
+      invoke<AiConfig>("get_ai_config"),
+      invoke<SnapshotListResult>("list_apfs_snapshots"),
+      invoke<boolean>("get_autostart_enabled"),
+    ]);
 
   if (versionResult.status === "fulfilled") {
     state.appVersion = versionResult.value;
@@ -1302,6 +1769,16 @@ async function init(): Promise<void> {
     state.aiConfig = configResult.value;
     state.language = configResult.value.language;
   }
+  if (snapshotResult.status === "fulfilled") {
+    state.snapshots = snapshotResult.value.snapshots;
+    state.snapshotsSupported = snapshotResult.value.supported;
+    state.snapshotsNote = snapshotResult.value.note;
+  }
+  if (autostartResult.status === "fulfilled") {
+    state.autostartEnabled = autostartResult.value;
+  }
+  state.snapshotsLoaded = true;
+  state.loadingSnapshots = false;
 
   renderActiveTab();
 }
