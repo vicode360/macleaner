@@ -68,6 +68,7 @@ pub struct KnownRule {
 #[derive(Debug, Clone)]
 pub struct RuleEngine {
     home_dir: PathBuf,
+    canonical_home_dir: Option<PathBuf>,
     protected_prefixes: Vec<PathBuf>,
     rules: Vec<KnownRule>,
 }
@@ -90,15 +91,36 @@ impl RuleEngine {
     pub fn from_toml_str(toml_str: &str, home_dir: &Path) -> Result<Self, toml::de::Error> {
         let raw: RawRulesFile = toml::from_str(toml_str)?;
         let normalized_home = normalize_path(home_dir);
+        let canonical_home_dir = fs::canonicalize(home_dir)
+            .ok()
+            .map(|p| normalize_path(&p))
+            .filter(|canonical| !paths_equal_platform(canonical, &normalized_home));
 
-        let protected_prefixes = raw
-            .protected
-            .sip_prefixes
-            .into_iter()
-            .chain(raw.protected.tcc_user_paths)
-            .map(|entry| expand_tilde(&entry, &normalized_home))
-            .map(|path| normalize_path(&path))
-            .collect();
+        let mut protected_prefixes: Vec<PathBuf> = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            let norm = normalize_path(&path);
+            if !protected_prefixes
+                .iter()
+                .any(|existing| paths_equal_platform(existing, &norm))
+            {
+                protected_prefixes.push(norm);
+            }
+        };
+
+        for entry in &raw.protected.sip_prefixes {
+            push_unique(expand_tilde(entry, &normalized_home));
+            if let Some(ref canonical_home) = canonical_home_dir {
+                if entry == "~" || entry.starts_with("~/") {
+                    push_unique(expand_tilde(entry, canonical_home));
+                }
+            }
+        }
+        for entry in &raw.protected.tcc_user_paths {
+            push_unique(expand_tilde(entry, &normalized_home));
+            if let Some(ref canonical_home) = canonical_home_dir {
+                push_unique(expand_tilde(entry, canonical_home));
+            }
+        }
 
         let rules = raw
             .rule
@@ -121,6 +143,7 @@ impl RuleEngine {
 
         Ok(Self {
             home_dir: normalized_home,
+            canonical_home_dir,
             protected_prefixes,
             rules,
         })
@@ -141,11 +164,12 @@ impl RuleEngine {
 
     #[must_use]
     pub fn is_protected_path(&self, path: &Path) -> bool {
-        if self.is_protected_normalized(path) {
+        let normalized = normalize_path(path);
+        if self.matches_protected(&normalized) {
             return true;
         }
 
-        if let Ok(canonical) = fs::canonicalize(path) {
+        if let Ok(canonical) = fs::canonicalize(&normalized) {
             if self.matches_protected(&canonical) {
                 return true;
             }
@@ -197,7 +221,7 @@ impl RuleEngine {
             return true;
         }
 
-        if let Ok(canonical) = fs::canonicalize(path) {
+        if let Ok(canonical) = fs::canonicalize(&normalized) {
             if self.matches_protected(&canonical) || self.matches_protected_ancestor(&canonical) {
                 return true;
             }
@@ -207,7 +231,13 @@ impl RuleEngine {
     }
 
     fn matches_protected(&self, candidate: &Path) -> bool {
-        if candidate == Path::new("/") || paths_equal_platform(candidate, &self.home_dir) {
+        if candidate == Path::new("/")
+            || paths_equal_platform(candidate, &self.home_dir)
+            || self
+                .canonical_home_dir
+                .as_deref()
+                .is_some_and(|canonical_home| paths_equal_platform(candidate, canonical_home))
+        {
             return true;
         }
 
@@ -495,6 +525,47 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+#[must_use]
+pub(crate) fn has_unsafe_raw_path_syntax(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return true;
+    }
+    let raw_bytes = path.as_os_str().as_encoded_bytes();
+    raw_bytes.len() > 1 && raw_bytes.ends_with(b"/")
+}
+
+#[must_use]
+pub(crate) fn verified_dir_under_home(canonical_home: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut current = canonical_home.to_path_buf();
+    let mut final_is_dir = false;
+
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => {
+                current.push(part);
+                let meta = fs::symlink_metadata(&current).ok()?;
+                if meta.file_type().is_symlink() {
+                    return None;
+                }
+                final_is_dir = meta.file_type().is_dir();
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+
+    if !final_is_dir {
+        return None;
+    }
+
+    let expected = normalize_path(&current);
+    let canonical = fs::canonicalize(&expected).ok()?;
+    paths_equal_platform(&canonical, &expected).then_some(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,5 +737,69 @@ mod tests {
                 .map(|r| r.id.as_str()),
             Some("uv-cache")
         );
+    }
+
+    #[test]
+    fn canonical_home_protects_both_symlinked_and_canonical_home_paths() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "macleaner_rules_canon_{}_{nanos}",
+            std::process::id()
+        ));
+        let real_home = base.join("real_home");
+        let link_home = base.join("link_home");
+        fs::create_dir_all(real_home.join("Library/Mail")).expect("create mail");
+        std::os::unix::fs::symlink(&real_home, &link_home).expect("symlink home");
+
+        let engine = RuleEngine::from_toml_str(KNOWN_RULES_TOML, &link_home).expect("rules");
+        let canonical_real = fs::canonicalize(&real_home).expect("canonical real");
+
+        assert!(engine.is_protected_normalized(&link_home));
+        assert!(engine.is_protected_normalized(&canonical_real));
+        assert!(engine.is_protected_normalized(&link_home.join("Library/Mail")));
+        assert!(engine.is_protected_normalized(&canonical_real.join("Library/Mail")));
+        assert!(engine.is_protected_or_ancestor(&canonical_real.join("Library")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn unsafe_raw_path_syntax_rejects_parent_dir_and_trailing_slash() {
+        assert!(has_unsafe_raw_path_syntax(Path::new("/Users/tester/foo/")));
+        assert!(has_unsafe_raw_path_syntax(Path::new(
+            "/Users/tester/../other"
+        )));
+        assert!(has_unsafe_raw_path_syntax(Path::new("//")));
+        assert!(!has_unsafe_raw_path_syntax(Path::new("/")));
+        assert!(!has_unsafe_raw_path_syntax(Path::new("/Users/tester/foo")));
+    }
+
+    #[test]
+    fn verified_dir_under_home_rejects_intermediate_and_leaf_symlinks() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "macleaner_rules_verified_{}_{nanos}",
+            std::process::id()
+        ));
+        let home = base.join("home");
+        let outside = base.join("outside");
+        fs::create_dir_all(home.join("a/b/c")).expect("create real");
+        fs::create_dir_all(outside.join("c")).expect("create outside");
+        std::os::unix::fs::symlink(&outside, home.join("a/sym_mid")).expect("mid symlink");
+        std::os::unix::fs::symlink(outside.join("c"), home.join("a/sym_leaf"))
+            .expect("leaf symlink");
+
+        let canonical_home = fs::canonicalize(&home).expect("canonical home");
+        assert!(verified_dir_under_home(&canonical_home, Path::new("a/b/c")).is_some());
+        assert!(verified_dir_under_home(&canonical_home, Path::new("a/sym_mid/c")).is_none());
+        assert!(verified_dir_under_home(&canonical_home, Path::new("a/sym_leaf")).is_none());
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

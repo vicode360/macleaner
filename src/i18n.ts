@@ -6,8 +6,12 @@ export interface CopyBundle {
   tabs: {
     resumo: string;
     itens: string;
+    dev: string;
     ajustes: string;
     navLabel: string;
+  };
+  confirm: {
+    permanentWarning: string;
   };
   header: {
     updateIdle: string;
@@ -145,6 +149,109 @@ export interface CopyBundle {
     oneDay: string;
     nDays: (n: string) => string;
   };
+  dev: {
+    subtabs: {
+      projects: string;
+      xcode: string;
+      docker: string;
+      tools: string;
+    };
+    refreshAria: string;
+    loading: string;
+    loadError: (err: string) => string;
+    cleanAction: string;
+    cleaningAction: string;
+    deleteAction: string;
+    deletingAction: string;
+    runAction: string;
+    runningAction: string;
+    projects: {
+      rootsTitle: string;
+      addFolder: string;
+      scan: string;
+      scanning: string;
+      removeRootAria: (name: string) => string;
+      noRootsHint: string;
+      noRootsTitle: string;
+      noRootsDesc: string;
+      filterAll: string;
+      filter30: string;
+      filter90: string;
+      cleanOlder: (days: number) => string;
+      emptyTitle: string;
+      emptyDesc: string;
+      filterEmptyTitle: string;
+      filterEmptyDesc: string;
+      summaryLine: (count: string, size: string) => string;
+      inactiveShort: (days: number) => string;
+      confirmTrashArtifact: (artifact: string, project: string, size: string) => string;
+      confirmTrashBulk: (count: number, size: string, days: number) => string;
+      rootAdded: (name: string) => string;
+      rootRemoved: (name: string) => string;
+      rootError: (err: string) => string;
+      scanError: (err: string) => string;
+    };
+    xcode: {
+      notInstalledTitle: string;
+      notInstalledDesc: string;
+      summaryTitle: string;
+      allCleanTitle: string;
+      allCleanDesc: string;
+      unavailableTitle: string;
+      unavailableDesc: string;
+      cleanUnavailable: string;
+      runtimesTitle: string;
+      areasTitle: string;
+      categoryLabels: Record<string, string>;
+      moreCount: (n: number) => string;
+      confirmUnavailable: (count: number, size: string) => string;
+      confirmRuntime: (name: string, size: string) => string;
+      confirmTrashArea: (name: string, size: string) => string;
+      unavailableCleaned: (count: number, size: string) => string;
+      runtimeDeleted: (name: string, size: string) => string;
+      actionError: (err: string) => string;
+    };
+    docker: {
+      notInstalledTitle: string;
+      notInstalledDesc: string;
+      stoppedTitle: string;
+      stoppedDesc: (engine: string) => string;
+      retry: string;
+      footprintLabel: string;
+      reclaimableLabel: string;
+      resourcesTitle: string;
+      activeOfTotal: (active: string, total: string) => string;
+      reclaimablePct: (size: string, pct: number) => string;
+      clean: string;
+      cleanStatus: string;
+      readOnlyBadge: string;
+      volumesSafetyNote: string;
+      kindLabels: Record<string, string>;
+      confirmPrune: (kindLabel: string, size: string) => string;
+      pruneSuccess: (size: string) => string;
+      pruneError: (err: string) => string;
+    };
+    tools: {
+      brewTitle: string;
+      dryRunBadge: string;
+      brewNotInstalled: string;
+      brewClean: string;
+      brewOutdatedSummary: (count: string, size: string) => string;
+      showPreview: (count: number) => string;
+      hidePreview: string;
+      runCleanup: string;
+      autoremoveTitle: (count: number) => string;
+      runAutoremove: string;
+      cachesTitle: string;
+      cachesEmpty: string;
+      confirmBrewCleanup: (size: string) => string;
+      confirmBrewAutoremove: (count: number) => string;
+      confirmTrashCache: (name: string, size: string) => string;
+      brewSuccess: (action: string, size: string) => string;
+      brewError: (err: string) => string;
+      cacheTrashed: (name: string, size: string) => string;
+    };
+  };
 }
 
 const BUNDLES: Record<AppLanguage, CopyBundle> = {
@@ -154,8 +261,12 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
     tabs: {
       resumo: "Resumo",
       itens: "Itens",
+      dev: "Dev",
       ajustes: "Ajustes",
       navLabel: "Navegação principal",
+    },
+    confirm: {
+      permanentWarning: "Ação permanente — não vai para a Lixeira",
     },
     header: {
       updateIdle: "Update",
@@ -227,10 +338,8 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       clearAll: "Limpar todos",
       remove: "Remover",
       removing: "Removendo…",
-      confirmSingle: (date) =>
-        `Remover permanentemente o snapshot APFS de ${date}? (Não vai para a Lixeira)`,
-      confirmAll: (count) =>
-        `Remover permanentemente ${count} snapshots APFS locais? (Não vão para a Lixeira)`,
+      confirmSingle: (date) => `Remover permanentemente o snapshot APFS de ${date}?`,
+      confirmAll: (count) => `Remover permanentemente ${count} snapshots APFS locais?`,
       confirmAction: "Remover Snapshot",
     },
     risk: {
@@ -304,6 +413,133 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       oneDay: "há 1 dia",
       nDays: (n) => `há ${n} dias`,
     },
+    dev: {
+      subtabs: {
+        projects: "Projetos",
+        xcode: "Xcode",
+        docker: "Docker",
+        tools: "Tools",
+      },
+      refreshAria: "Atualizar seção Dev",
+      loading: "Inspecionando ambiente…",
+      loadError: (err) => `Erro ao inspecionar: ${err}`,
+      cleanAction: "Limpar",
+      cleaningAction: "Limpando…",
+      deleteAction: "Remover",
+      deletingAction: "Removendo…",
+      runAction: "Executar",
+      runningAction: "Executando…",
+      projects: {
+        rootsTitle: "Pastas Dev",
+        addFolder: "Pasta",
+        scan: "Escanear",
+        scanning: "Escaneando…",
+        removeRootAria: (name) => `Remover pasta ${name}`,
+        noRootsHint: "Adicione uma pasta de código (ex.: ~/Projects) para encontrar node_modules, target e .venv.",
+        noRootsTitle: "Nenhuma pasta configurada",
+        noRootsDesc: "Adicione suas pastas de projetos para detectar artefatos de build recuperáveis.",
+        filterAll: "Todos",
+        filter30: ">30d",
+        filter90: ">90d",
+        cleanOlder: (days) => `Limpar >${days}d`,
+        emptyTitle: "Nenhum artefato encontrado",
+        emptyDesc: "Nenhum artefato pesado (node_modules, target, .venv, build) detectado nas pastas monitoradas.",
+        filterEmptyTitle: "Nenhum projeto neste filtro",
+        filterEmptyDesc: "Tente outro período de inatividade ou reescaneie suas pastas.",
+        summaryLine: (count, size) => `${count} projetos · ${size}`,
+        inactiveShort: (days) => (days === 0 ? "hoje" : `${days}d`),
+        confirmTrashArtifact: (artifact, project, size) =>
+          `Mover "${artifact}" de ${project} (${size}) para a Lixeira?`,
+        confirmTrashBulk: (count, size, days) =>
+          `Mover ${count} artefatos de projetos inativos há >${days}d (${size}) para a Lixeira?`,
+        rootAdded: (name) => `Pasta "${name}" adicionada`,
+        rootRemoved: (name) => `Pasta "${name}" removida`,
+        rootError: (err) => `Erro ao gerenciar pastas: ${err}`,
+        scanError: (err) => `Falha ao escanear projetos: ${err}`,
+      },
+      xcode: {
+        notInstalledTitle: "Xcode não detectado",
+        notInstalledDesc: "Nenhum dado do Xcode ou simuladores foi encontrado neste Mac.",
+        summaryTitle: "Xcode & Simuladores",
+        allCleanTitle: "Xcode limpo",
+        allCleanDesc: "Nenhum cache pesado, simulador indisponível ou runtime encontrado.",
+        unavailableTitle: "Simuladores indisponíveis",
+        unavailableDesc: "Dispositivos órfãos de versões antigas do Xcode.",
+        cleanUnavailable: "Limpar indisponíveis",
+        runtimesTitle: "Runtimes de Simulador",
+        areasTitle: "Áreas do Xcode",
+        categoryLabels: {
+          derived_data: "DerivedData",
+          archives: "Arquivos",
+          device_support: "DeviceSupport",
+          simulator_caches: "Caches",
+          previews: "Previews",
+        },
+        moreCount: (n) => `+${n} mais`,
+        confirmUnavailable: (count, size) =>
+          `Remover ${count} simuladores indisponíveis (${size}) via simctl?`,
+        confirmRuntime: (name, size) =>
+          `Remover runtime "${name}" (${size}) via simctl?`,
+        confirmTrashArea: (name, size) =>
+          `Mover "${name}" (${size}) para a Lixeira?`,
+        unavailableCleaned: (count, size) =>
+          `${count} simuladores removidos (${size})`,
+        runtimeDeleted: (name, size) =>
+          `Runtime "${name}" removido (${size})`,
+        actionError: (err) => `Erro no Xcode: ${err}`,
+      },
+      docker: {
+        notInstalledTitle: "Docker / OrbStack não detectado",
+        notInstalledDesc: "Instale o Docker Desktop ou OrbStack para inspecionar imagens, containers e caches.",
+        stoppedTitle: "Daemon parado",
+        stoppedDesc: (engine) => `Inicie o ${engine} para inspecionar e limpar recursos de container.`,
+        retry: "Tentar novamente",
+        footprintLabel: "Uso em disco",
+        reclaimableLabel: "Recuperável",
+        resourcesTitle: "Recursos",
+        activeOfTotal: (active, total) => `${active} ativos de ${total}`,
+        reclaimablePct: (size, pct) => `${size} (${pct}%)`,
+        clean: "Limpar",
+        cleanStatus: "Limpo",
+        readOnlyBadge: "Somente leitura",
+        volumesSafetyNote: "Volumes podem conter bancos de dados e nunca são limpos automaticamente.",
+        kindLabels: {
+          "build-cache": "Build Cache",
+          images: "Imagens",
+          containers: "Containers",
+          volumes: "Volumes Locais",
+        },
+        confirmPrune: (kindLabel, size) =>
+          `Executar prune permanente em ${kindLabel} (~${size} recuperáveis)?`,
+        pruneSuccess: (size) => `Docker limpo: ${size} liberados`,
+        pruneError: (err) => `Erro ao limpar Docker: ${err}`,
+      },
+      tools: {
+        brewTitle: "Homebrew",
+        dryRunBadge: "Dry-run",
+        brewNotInstalled: "Homebrew não detectado neste Mac.",
+        brewClean: "Homebrew já está limpo — nenhum pacote obsoleto encontrado.",
+        brewOutdatedSummary: (count, size) => `${count} itens antigos · ~${size} recuperáveis`,
+        showPreview: (count) => `Prévia (${count})`,
+        hidePreview: "Ocultar prévia",
+        runCleanup: "Executar brew cleanup",
+        autoremoveTitle: (count) => `${count} dependências órfãs (autoremove)`,
+        runAutoremove: "Executar brew autoremove",
+        cachesTitle: "Caches de Toolchains",
+        cachesEmpty: "Nenhum cache pesado de toolchain detectado.",
+        confirmBrewCleanup: (size) =>
+          `Executar "brew cleanup" permanentemente (~${size} recuperáveis)?`,
+        confirmBrewAutoremove: (count) =>
+          `Executar "brew autoremove" para remover ${count} dependências órfãs?`,
+        confirmTrashCache: (name, size) =>
+          `Mover cache "${name}" (${size}) para a Lixeira?`,
+        brewSuccess: (action, size) =>
+          `${action} concluído (${size})`,
+        brewError: (err) => `Erro no Homebrew: ${err}`,
+        cacheTrashed: (name, size) =>
+          `"${name}" (${size}) movido para a Lixeira`,
+      },
+    },
   },
   en: {
     htmlLang: "en",
@@ -311,8 +547,12 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
     tabs: {
       resumo: "Summary",
       itens: "Items",
+      dev: "Dev",
       ajustes: "Settings",
       navLabel: "Main navigation",
+    },
+    confirm: {
+      permanentWarning: "Permanent action — does not go to Trash",
     },
     header: {
       updateIdle: "Update",
@@ -384,10 +624,8 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       clearAll: "Purge all",
       remove: "Delete",
       removing: "Deleting…",
-      confirmSingle: (date) =>
-        `Permanently delete APFS snapshot from ${date}? (Does not go to Trash)`,
-      confirmAll: (count) =>
-        `Permanently delete ${count} local APFS snapshots? (Cannot be undone via Trash)`,
+      confirmSingle: (date) => `Permanently delete APFS snapshot from ${date}?`,
+      confirmAll: (count) => `Permanently delete ${count} local APFS snapshots?`,
       confirmAction: "Delete Snapshot",
     },
     risk: {
@@ -461,15 +699,146 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       oneDay: "1 day ago",
       nDays: (n) => `${n} days ago`,
     },
+    dev: {
+      subtabs: {
+        projects: "Projects",
+        xcode: "Xcode",
+        docker: "Docker",
+        tools: "Tools",
+      },
+      refreshAria: "Refresh Dev section",
+      loading: "Inspecting environment…",
+      loadError: (err) => `Inspection error: ${err}`,
+      cleanAction: "Clean",
+      cleaningAction: "Cleaning…",
+      deleteAction: "Delete",
+      deletingAction: "Deleting…",
+      runAction: "Run",
+      runningAction: "Running…",
+      projects: {
+        rootsTitle: "Dev folders",
+        addFolder: "Folder",
+        scan: "Scan",
+        scanning: "Scanning…",
+        removeRootAria: (name) => `Remove folder ${name}`,
+        noRootsHint: "Add a code folder (e.g. ~/Projects) to locate node_modules, target, and .venv.",
+        noRootsTitle: "No folders configured",
+        noRootsDesc: "Add your project folders to discover reclaimable build artifacts.",
+        filterAll: "All",
+        filter30: ">30d",
+        filter90: ">90d",
+        cleanOlder: (days) => `Clean >${days}d`,
+        emptyTitle: "No artifacts found",
+        emptyDesc: "No heavy build artifacts (node_modules, target, .venv, build) found in watched folders.",
+        filterEmptyTitle: "No projects in this filter",
+        filterEmptyDesc: "Pick another inactivity window or rescan your folders.",
+        summaryLine: (count, size) => `${count} projects · ${size}`,
+        inactiveShort: (days) => (days === 0 ? "today" : `${days}d`),
+        confirmTrashArtifact: (artifact, project, size) =>
+          `Move "${artifact}" from ${project} (${size}) to Trash?`,
+        confirmTrashBulk: (count, size, days) =>
+          `Move ${count} artifacts from projects inactive >${days}d (${size}) to Trash?`,
+        rootAdded: (name) => `Folder "${name}" added`,
+        rootRemoved: (name) => `Folder "${name}" removed`,
+        rootError: (err) => `Folder update failed: ${err}`,
+        scanError: (err) => `Project scan failed: ${err}`,
+      },
+      xcode: {
+        notInstalledTitle: "Xcode not detected",
+        notInstalledDesc: "No Xcode data or simulators were found on this Mac.",
+        summaryTitle: "Xcode & Simulators",
+        allCleanTitle: "Xcode is clean",
+        allCleanDesc: "No heavy caches, unavailable simulators, or runtimes found.",
+        unavailableTitle: "Unavailable simulators",
+        unavailableDesc: "Orphaned simulator devices from older Xcode releases.",
+        cleanUnavailable: "Clean unavailable",
+        runtimesTitle: "Simulator Runtimes",
+        areasTitle: "Xcode Areas",
+        categoryLabels: {
+          derived_data: "DerivedData",
+          archives: "Archives",
+          device_support: "DeviceSupport",
+          simulator_caches: "Caches",
+          previews: "Previews",
+        },
+        moreCount: (n) => `+${n} more`,
+        confirmUnavailable: (count, size) =>
+          `Delete ${count} unavailable simulators (${size}) via simctl?`,
+        confirmRuntime: (name, size) =>
+          `Delete runtime "${name}" (${size}) via simctl?`,
+        confirmTrashArea: (name, size) =>
+          `Move "${name}" (${size}) to Trash?`,
+        unavailableCleaned: (count, size) =>
+          `${count} simulators deleted (${size})`,
+        runtimeDeleted: (name, size) =>
+          `Runtime "${name}" deleted (${size})`,
+        actionError: (err) => `Xcode error: ${err}`,
+      },
+      docker: {
+        notInstalledTitle: "Docker / OrbStack not detected",
+        notInstalledDesc: "Install Docker Desktop or OrbStack to inspect images, containers, and caches.",
+        stoppedTitle: "Daemon stopped",
+        stoppedDesc: (engine) => `Start ${engine} to inspect and prune container resources.`,
+        retry: "Retry",
+        footprintLabel: "Disk footprint",
+        reclaimableLabel: "Reclaimable",
+        resourcesTitle: "Resources",
+        activeOfTotal: (active, total) => `${active} active of ${total}`,
+        reclaimablePct: (size, pct) => `${size} (${pct}%)`,
+        clean: "Prune",
+        cleanStatus: "Clean",
+        readOnlyBadge: "Read-only",
+        volumesSafetyNote: "Volumes may hold databases and are never pruned automatically.",
+        kindLabels: {
+          "build-cache": "Build Cache",
+          images: "Images",
+          containers: "Containers",
+          volumes: "Local Volumes",
+        },
+        confirmPrune: (kindLabel, size) =>
+          `Permanently prune ${kindLabel} (~${size} reclaimable)?`,
+        pruneSuccess: (size) => `Docker pruned: ${size} freed`,
+        pruneError: (err) => `Docker prune error: ${err}`,
+      },
+      tools: {
+        brewTitle: "Homebrew",
+        dryRunBadge: "Dry-run",
+        brewNotInstalled: "Homebrew was not detected on this Mac.",
+        brewClean: "Homebrew is already clean — no outdated items found.",
+        brewOutdatedSummary: (count, size) => `${count} outdated items · ~${size} reclaimable`,
+        showPreview: (count) => `Preview (${count})`,
+        hidePreview: "Hide preview",
+        runCleanup: "Run brew cleanup",
+        autoremoveTitle: (count) => `${count} unused dependencies (autoremove)`,
+        runAutoremove: "Run brew autoremove",
+        cachesTitle: "Toolchain Caches",
+        cachesEmpty: "No heavy toolchain caches detected.",
+        confirmBrewCleanup: (size) =>
+          `Run "brew cleanup" permanently (~${size} reclaimable)?`,
+        confirmBrewAutoremove: (count) =>
+          `Run "brew autoremove" to uninstall ${count} unused dependencies?`,
+        confirmTrashCache: (name, size) =>
+          `Move "${name}" cache (${size}) to Trash?`,
+        brewSuccess: (action, size) =>
+          `${action} completed (${size})`,
+        brewError: (err) => `Homebrew error: ${err}`,
+        cacheTrashed: (name, size) =>
+          `"${name}" (${size}) moved to Trash`,
+      },
+    },
   },
   es: {
     htmlLang: "es",
     locale: "es-ES",
     tabs: {
       resumo: "Resumen",
-      itens: "Elementos",
+      itens: "Ítems",
+      dev: "Dev",
       ajustes: "Ajustes",
       navLabel: "Navegación principal",
+    },
+    confirm: {
+      permanentWarning: "Acción permanente — no va a la Papelera",
     },
     header: {
       updateIdle: "Update",
@@ -541,10 +910,8 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       clearAll: "Limpiar todos",
       remove: "Eliminar",
       removing: "Eliminando…",
-      confirmSingle: (date) =>
-        `¿Eliminar permanentemente el snapshot APFS de ${date}? (No va a la Papelera)`,
-      confirmAll: (count) =>
-        `¿Eliminar permanentemente ${count} snapshots APFS locales? (No van a la Papelera)`,
+      confirmSingle: (date) => `¿Eliminar permanentemente el snapshot APFS de ${date}?`,
+      confirmAll: (count) => `¿Eliminar permanentemente ${count} snapshots APFS locales?`,
       confirmAction: "Eliminar Snapshot",
     },
     risk: {
@@ -562,7 +929,7 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       lowDiskAlertLabel: "Alerta de poco espacio (< 15% libre)",
       lowDiskAlertHint: "Envía una notificación nativa cuando el volumen cae del 15% libre.",
       allowlistLabel: "Carpetas Ignoradas (Allowlist)",
-      allowlistEmpty: "Ninguna carpeta ignorada. Usa \"Ignorar siempre\" en Elementos para omitir carpetas en el escaneo.",
+      allowlistEmpty: "Ninguna carpeta ignorada. Usa \"Ignorar siempre\" en Ítems para omitir carpetas en el escaneo.",
       allowlistHint: "Estas carpetas se omiten en el escaneo y en la IA. Quita una para volver a analizarla.",
       allowlistRestore: "Quitar",
       minFolderSize: "Tamaño mínimo de carpeta",
@@ -617,6 +984,133 @@ const BUNDLES: Record<AppLanguage, CopyBundle> = {
       today: "hoy",
       oneDay: "hace 1 día",
       nDays: (n) => `hace ${n} días`,
+    },
+    dev: {
+      subtabs: {
+        projects: "Proyectos",
+        xcode: "Xcode",
+        docker: "Docker",
+        tools: "Tools",
+      },
+      refreshAria: "Actualizar sección Dev",
+      loading: "Inspeccionando entorno…",
+      loadError: (err) => `Error al inspeccionar: ${err}`,
+      cleanAction: "Limpiar",
+      cleaningAction: "Limpiando…",
+      deleteAction: "Eliminar",
+      deletingAction: "Eliminando…",
+      runAction: "Ejecutar",
+      runningAction: "Ejecutando…",
+      projects: {
+        rootsTitle: "Carpetas Dev",
+        addFolder: "Carpeta",
+        scan: "Escanear",
+        scanning: "Escaneando…",
+        removeRootAria: (name) => `Quitar carpeta ${name}`,
+        noRootsHint: "Añade una carpeta de código (ej.: ~/Projects) para hallar node_modules, target y .venv.",
+        noRootsTitle: "Sin carpetas configuradas",
+        noRootsDesc: "Añade tus carpetas de proyectos para detectar artefactos de compilación recuperables.",
+        filterAll: "Todos",
+        filter30: ">30d",
+        filter90: ">90d",
+        cleanOlder: (days) => `Limpiar >${days}d`,
+        emptyTitle: "Sin artefactos encontrados",
+        emptyDesc: "No se hallaron artefactos pesados (node_modules, target, .venv, build) en las carpetas monitoreadas.",
+        filterEmptyTitle: "Sin proyectos en este filtro",
+        filterEmptyDesc: "Elige otro rango de inactividad o escanea de nuevo.",
+        summaryLine: (count, size) => `${count} proyectos · ${size}`,
+        inactiveShort: (days) => (days === 0 ? "hoy" : `${days}d`),
+        confirmTrashArtifact: (artifact, project, size) =>
+          `¿Mover "${artifact}" de ${project} (${size}) a la Papelera?`,
+        confirmTrashBulk: (count, size, days) =>
+          `¿Mover ${count} artefactos de proyectos inactivos >${days}d (${size}) a la Papelera?`,
+        rootAdded: (name) => `Carpeta "${name}" añadida`,
+        rootRemoved: (name) => `Carpeta "${name}" quitada`,
+        rootError: (err) => `Error al gestionar carpetas: ${err}`,
+        scanError: (err) => `Fallo al escanear proyectos: ${err}`,
+      },
+      xcode: {
+        notInstalledTitle: "Xcode no detectado",
+        notInstalledDesc: "No se encontraron datos de Xcode ni simuladores en este Mac.",
+        summaryTitle: "Xcode y Simuladores",
+        allCleanTitle: "Xcode limpio",
+        allCleanDesc: "No se encontraron cachés pesadas, simuladores no disponibles ni runtimes.",
+        unavailableTitle: "Simuladores no disponibles",
+        unavailableDesc: "Dispositivos huérfanos de versiones anteriores de Xcode.",
+        cleanUnavailable: "Limpiar no disponibles",
+        runtimesTitle: "Runtimes de Simulador",
+        areasTitle: "Áreas de Xcode",
+        categoryLabels: {
+          derived_data: "DerivedData",
+          archives: "Archivos",
+          device_support: "DeviceSupport",
+          simulator_caches: "Cachés",
+          previews: "Previews",
+        },
+        moreCount: (n) => `+${n} más`,
+        confirmUnavailable: (count, size) =>
+          `¿Eliminar ${count} simuladores no disponibles (${size}) vía simctl?`,
+        confirmRuntime: (name, size) =>
+          `¿Eliminar runtime "${name}" (${size}) vía simctl?`,
+        confirmTrashArea: (name, size) =>
+          `¿Mover "${name}" (${size}) a la Papelera?`,
+        unavailableCleaned: (count, size) =>
+          `${count} simuladores eliminados (${size})`,
+        runtimeDeleted: (name, size) =>
+          `Runtime "${name}" eliminado (${size})`,
+        actionError: (err) => `Error en Xcode: ${err}`,
+      },
+      docker: {
+        notInstalledTitle: "Docker / OrbStack no detectado",
+        notInstalledDesc: "Instala Docker Desktop u OrbStack para inspeccionar imágenes, contenedores y cachés.",
+        stoppedTitle: "Daemon detenido",
+        stoppedDesc: (engine) => `Inicia ${engine} para inspeccionar y limpiar recursos de contenedores.`,
+        retry: "Reintentar",
+        footprintLabel: "Uso en disco",
+        reclaimableLabel: "Recuperable",
+        resourcesTitle: "Recursos",
+        activeOfTotal: (active, total) => `${active} activos de ${total}`,
+        reclaimablePct: (size, pct) => `${size} (${pct}%)`,
+        clean: "Limpiar",
+        cleanStatus: "Limpio",
+        readOnlyBadge: "Solo lectura",
+        volumesSafetyNote: "Los volúmenes pueden contener bases de datos y nunca se limpian automáticamente.",
+        kindLabels: {
+          "build-cache": "Build Cache",
+          images: "Imágenes",
+          containers: "Contenedores",
+          volumes: "Volúmenes Locales",
+        },
+        confirmPrune: (kindLabel, size) =>
+          `¿Ejecutar prune permanente en ${kindLabel} (~${size} recuperables)?`,
+        pruneSuccess: (size) => `Docker limpio: ${size} liberados`,
+        pruneError: (err) => `Error al limpiar Docker: ${err}`,
+      },
+      tools: {
+        brewTitle: "Homebrew",
+        dryRunBadge: "Dry-run",
+        brewNotInstalled: "Homebrew no fue detectado en este Mac.",
+        brewClean: "Homebrew ya está limpio — sin elementos obsoletos.",
+        brewOutdatedSummary: (count, size) => `${count} elementos antiguos · ~${size} recuperables`,
+        showPreview: (count) => `Vista previa (${count})`,
+        hidePreview: "Ocultar vista previa",
+        runCleanup: "Ejecutar brew cleanup",
+        autoremoveTitle: (count) => `${count} dependencias huérfanas (autoremove)`,
+        runAutoremove: "Ejecutar brew autoremove",
+        cachesTitle: "Cachés de Toolchains",
+        cachesEmpty: "No se detectaron cachés pesadas de toolchains.",
+        confirmBrewCleanup: (size) =>
+          `¿Ejecutar "brew cleanup" permanentemente (~${size} recuperables)?`,
+        confirmBrewAutoremove: (count) =>
+          `¿Ejecutar "brew autoremove" para quitar ${count} dependencias huérfanas?`,
+        confirmTrashCache: (name, size) =>
+          `¿Mover caché "${name}" (${size}) a la Papelera?`,
+        brewSuccess: (action, size) =>
+          `${action} completado (${size})`,
+        brewError: (err) => `Error en Homebrew: ${err}`,
+        cacheTrashed: (name, size) =>
+          `"${name}" (${size}) movida a la Papelera`,
+      },
     },
   },
 };

@@ -70,6 +70,8 @@ export interface AiConfig {
   timeoutMs: number;
   ignoredPaths: string[];
   lowDiskAlertEnabled: boolean;
+  devProjectRoots?: string[];
+  devRootsInitialized?: boolean;
 }
 
 export interface AiStatus {
@@ -131,3 +133,132 @@ export type ScanEvent =
   | { event: "started"; data: { totalTargets: number } }
   | { event: "progress"; data: { currentPath: string; scannedBytes: number } }
   | { event: "finished"; data: { summary: ScanSummary } };
+
+export interface DevArtifact {
+  path: string;
+  name: string;
+  sizeBytes: number;
+}
+
+export interface DevProject {
+  id: string;
+  name: string;
+  path: string;
+  kind: string;
+  totalArtifactBytes: number;
+  inactiveDays: number;
+  artifacts: DevArtifact[];
+}
+
+export interface DevProjectsReport {
+  roots: string[];
+  projects: DevProject[];
+  totalReclaimableBytes: number;
+  scanDurationMs: number;
+}
+
+export interface DevTrashResult {
+  trashedPaths: string[];
+  freedBytes: number;
+  failed: TrashFailure[];
+}
+
+export interface XcodeAreaItem {
+  id: string;
+  category: string;
+  name: string;
+  path: string;
+  sizeBytes: number;
+  inactiveDays: number;
+}
+
+export interface UnavailableSimulator {
+  udid: string;
+  name: string;
+  runtime: string;
+  state: string;
+  sizeBytes: number;
+}
+
+export interface SimulatorRuntime {
+  identifier: string;
+  name: string;
+  build: string;
+  sizeBytes: number;
+  state: string;
+}
+
+export interface XcodeReport {
+  installed: boolean;
+  areas: XcodeAreaItem[];
+  unavailableSimulators: UnavailableSimulator[];
+  unavailableTotalBytes: number;
+  runtimes: SimulatorRuntime[];
+  totalReclaimableBytes: number;
+}
+
+export interface XcodeActionResult {
+  freedBytes: number;
+  deletedCount: number;
+  failed: TrashFailure[];
+}
+
+export type DockerPruneScope = "build-cache" | "unused-images" | "stopped-containers";
+
+export interface DockerResourceRow {
+  kind: string;
+  totalCount: number;
+  activeCount: number;
+  sizeBytes: number;
+  reclaimableBytes: number;
+  reclaimablePercent: number;
+  pruneScope: DockerPruneScope | null;
+  readOnly: boolean;
+}
+
+export interface DockerReport {
+  installed: boolean;
+  daemonRunning: boolean;
+  engineName: string;
+  orbstackDetected: boolean;
+  diskFootprintBytes: number;
+  totalReclaimableBytes: number;
+  resources: DockerResourceRow[];
+  error: string | null;
+}
+
+export interface DockerPruneResult {
+  scope: DockerPruneScope;
+  reclaimedBytes: number;
+  rawSummary: string;
+}
+
+export interface HomebrewReport {
+  installed: boolean;
+  outdatedCount: number;
+  reclaimableBytes: number;
+  autoremovePackages: string[];
+  previewLines: string[];
+}
+
+export interface ToolchainCacheItem {
+  id: string;
+  name: string;
+  ecosystem: string;
+  path: string;
+  sizeBytes: number;
+}
+
+export interface ToolchainsReport {
+  homebrew: HomebrewReport;
+  caches: ToolchainCacheItem[];
+  totalReclaimableBytes: number;
+}
+
+export type BrewCleanAction = "cleanup" | "autoremove";
+
+export interface BrewCleanResult {
+  action: BrewCleanAction;
+  freedBytes: number;
+  summary: string;
+}

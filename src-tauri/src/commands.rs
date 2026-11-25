@@ -85,6 +85,8 @@ pub enum AppError {
     SnapshotFailed(String),
     #[error("failed to update launch at login: {0}")]
     Autostart(String),
+    #[error("{0}")]
+    DevTools(String),
 }
 
 impl Serialize for AppError {
@@ -124,7 +126,10 @@ pub struct AppState {
     pub(crate) ai_cache: Mutex<AiClassificationCache>,
     pub(crate) ai_cache_path: Option<PathBuf>,
     pub(crate) last_sizes: Mutex<HashMap<String, u64>>,
+    pub(crate) dev_last_sizes: Mutex<HashMap<String, u64>>,
     pub(crate) scan_in_progress: Arc<AtomicBool>,
+    pub(crate) dev_scan_in_progress: Arc<AtomicBool>,
+    pub(crate) folder_picker_open: Arc<AtomicBool>,
     pub(crate) low_disk_notified: AtomicBool,
 }
 
@@ -157,7 +162,10 @@ impl AppState {
             ai_cache: Mutex::new(initial_cache),
             ai_cache_path,
             last_sizes: Mutex::new(HashMap::new()),
+            dev_last_sizes: Mutex::new(HashMap::new()),
             scan_in_progress: Arc::new(AtomicBool::new(false)),
+            dev_scan_in_progress: Arc::new(AtomicBool::new(false)),
+            folder_picker_open: Arc::new(AtomicBool::new(false)),
             low_disk_notified: AtomicBool::new(false),
         })
     }
@@ -281,9 +289,29 @@ pub fn get_disk_health(app: tauri::AppHandle) -> DiskHealth {
 #[tauri::command]
 pub async fn reveal_in_finder(path: String, state: State<'_, AppState>) -> Result<(), AppError> {
     let rules = Arc::clone(&state.rules);
+    let dev_roots = {
+        let cfg = state.ai_config.lock().expect("ai_config lock poisoned");
+        crate::dev_projects::effective_roots(
+            &cfg.dev_project_roots,
+            cfg.dev_roots_initialized,
+            &rules,
+        )
+    };
     tauri::async_runtime::spawn_blocking(move || {
+        let candidate = Path::new(&path);
         let canonical = validate_cleanable_target(&rules, &path)
-            .map_err(|msg| AppError::InvalidRevealPath(msg.to_string()))?;
+            .ok()
+            .or_else(|| {
+                crate::dev_projects::validate_dev_reveal_target(candidate, &dev_roots, &rules).ok()
+            })
+            .or_else(|| crate::xcode::validate_xcode_trash_target(candidate, &rules).ok())
+            .or_else(|| crate::toolchains::validate_toolchain_cache_target(candidate, &rules).ok())
+            .ok_or_else(|| {
+                AppError::InvalidRevealPath(
+                    "Caminho inválido ou fora do escopo permitido para exibir no Finder."
+                        .to_string(),
+                )
+            })?;
         let status = Command::new("/usr/bin/open")
             .arg("-R")
             .arg(&canonical)
@@ -593,23 +621,32 @@ pub fn get_ai_config(state: State<'_, AppState>) -> Result<AiConfig, AppError> {
     Ok(config)
 }
 
-#[tauri::command]
-pub fn set_ai_config(
+fn apply_ai_config_update(
+    ai_config: &Mutex<AiConfig>,
+    config_path: Option<&Path>,
     mut config: AiConfig,
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<AiConfig, AppError> {
     config.ignored_paths = normalize_ignored_paths(&config.ignored_paths);
     validate_config(&config)?;
-    if let Some(ref path) = state.config_path {
+    let mut guard = ai_config.lock().expect("ai_config lock poisoned");
+    config.dev_project_roots = guard.dev_project_roots.clone();
+    config.dev_roots_initialized = guard.dev_roots_initialized;
+    if let Some(path) = config_path {
         save_persisted_config(path, &config)?;
     }
-    {
-        let mut guard = state.ai_config.lock().expect("ai_config lock poisoned");
-        *guard = config.clone();
-    }
-    crate::sync_tray_disk_status(&app);
+    *guard = config.clone();
     Ok(config)
+}
+
+#[tauri::command]
+pub fn set_ai_config(
+    config: AiConfig,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AiConfig, AppError> {
+    let updated = apply_ai_config_update(&state.ai_config, state.config_path.as_deref(), config)?;
+    crate::sync_tray_disk_status(&app);
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -822,7 +859,7 @@ fn load_persisted_config(path: &Path) -> Option<AiConfig> {
     Some(parsed)
 }
 
-fn save_persisted_config(path: &Path, config: &AiConfig) -> Result<(), AppError> {
+pub(crate) fn save_persisted_config(path: &Path, config: &AiConfig) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| AppError::SettingsIo(err.to_string()))?;
     }
@@ -916,5 +953,33 @@ mod tests {
         assert!(!item.selected);
         assert_eq!(item.subitems[0].risk, RiskLevel::Alto);
         assert!(!item.subitems[0].safe_to_clean);
+    }
+
+    #[test]
+    fn apply_ai_config_update_unconditionally_preserves_dev_project_roots() {
+        let initial = AiConfig {
+            dev_project_roots: vec!["/Users/dev/Projects".to_string()],
+            dev_roots_initialized: true,
+            ..AiConfig::default()
+        };
+        let lock = Mutex::new(initial);
+
+        let incoming = AiConfig {
+            min_mb: 25,
+            dev_project_roots: vec!["/stale/clobber".to_string()],
+            dev_roots_initialized: true,
+            ..AiConfig::default()
+        };
+
+        let updated = apply_ai_config_update(&lock, None, incoming).expect("update succeeds");
+        assert_eq!(updated.min_mb, 25);
+        assert_eq!(
+            updated.dev_project_roots,
+            vec!["/Users/dev/Projects".to_string()]
+        );
+        assert!(updated.dev_roots_initialized);
+
+        let stored = lock.lock().expect("lock").clone();
+        assert_eq!(stored, updated);
     }
 }

@@ -1,8 +1,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
+  AlertTriangle,
   ArrowUpCircle,
   ChevronDown,
   ChevronRight,
+  Code2,
   Cpu,
   EyeOff,
   FolderOpen,
@@ -18,6 +20,8 @@ import {
   createElement,
   type IconNode,
 } from "lucide";
+import { createDevPanel, type CleanedPathItem, type DevConfirmRequest } from "./dev-panel";
+import { createDustBar, riskToDustVariant } from "./dust-bar";
 import {
   formatBytes,
   formatDays,
@@ -43,19 +47,31 @@ import type {
   UpdateInstallEvent,
 } from "./types";
 
-type TabId = "resumo" | "itens" | "ajustes";
+type TabId = "resumo" | "itens" | "dev" | "ajustes";
 type RiskFilter = "todos" | RiskLevel;
 
 type PendingConfirmAction =
   | {
       kind: "trash";
+      originTab: TabId;
+      isPermanent: false;
       paths: string[];
       getLabel: () => string;
     }
   | {
       kind: "snapshot";
+      originTab: TabId;
+      isPermanent: true;
       dateTokens: string[];
       getLabel: () => string;
+    }
+  | {
+      kind: "dev";
+      originTab: "dev";
+      isPermanent: boolean;
+      getLabel: () => string;
+      getActionLabel: (inProgress: boolean) => string;
+      onConfirm: () => Promise<void>;
     };
 
 interface AppViewState {
@@ -94,7 +110,7 @@ interface AppViewState {
 
 const state: AppViewState = {
   activeTab: "resumo",
-  appVersion: "0.2.1",
+  appVersion: "0.3.0",
   language: "pt-br",
   updateResult: null,
   checkingUpdate: false,
@@ -128,6 +144,7 @@ const state: AppViewState = {
 
 const panelResumo = mustEl<HTMLElement>("#panel-resumo");
 const panelItens = mustEl<HTMLElement>("#panel-itens");
+const panelDev = mustEl<HTMLElement>("#panel-dev");
 const panelAjustes = mustEl<HTMLElement>("#panel-ajustes");
 const brandIconSlot = mustEl<HTMLElement>("#brand-icon-slot");
 const versionTag = mustEl<HTMLElement>("#version-tag");
@@ -136,13 +153,60 @@ const rescanIconBtn = mustEl<HTMLButtonElement>("#rescan-icon-btn");
 const tabListEl = mustEl<HTMLElement>("#tab-list");
 const tabResumoBtn = mustEl<HTMLButtonElement>("#tab-resumo");
 const tabItensBtn = mustEl<HTMLButtonElement>("#tab-itens");
+const tabDevBtn = mustEl<HTMLButtonElement>("#tab-dev");
 const tabAjustesBtn = mustEl<HTMLButtonElement>("#tab-ajustes");
 const confirmBar = mustEl<HTMLElement>("#confirm-bar");
+const confirmPermanentBadge = mustEl<HTMLElement>("#confirm-permanent-badge");
 const confirmMessage = mustEl<HTMLElement>("#confirm-message");
 const confirmCancelBtn = mustEl<HTMLButtonElement>("#confirm-cancel-btn");
 const confirmAcceptBtn = mustEl<HTMLButtonElement>("#confirm-accept-btn");
 const toastEl = mustEl<HTMLElement>("#toast");
-const tabButtons = [tabResumoBtn, tabItensBtn, tabAjustesBtn];
+const tabButtons = [tabResumoBtn, tabItensBtn, tabDevBtn, tabAjustesBtn];
+
+const devPanel = createDevPanel({
+  container: panelDev,
+  getLanguage: () => state.language,
+  isGlobalBusy: () => state.scanning || state.trashing || state.deletingSnapshots,
+  requestConfirm: (req: DevConfirmRequest) => {
+    state.pendingConfirm = {
+      kind: "dev",
+      originTab: "dev",
+      ...req,
+    };
+    updateConfirmBar();
+  },
+  clearConfirm: () => {
+    if (state.pendingConfirm?.originTab === "dev" && !isMutating()) {
+      state.pendingConfirm = null;
+      updateConfirmBar();
+    }
+  },
+  showToast,
+  revealInFinder,
+  onStateChange: () => {
+    updateChrome();
+    updateConfirmBar();
+  },
+  onCleaned: async (trashedPaths: string[], cleanedItems?: CleanedPathItem[]) => {
+    reconcileSummaryAfterTrash(trashedPaths, cleanedItems);
+    await refreshDiskHealth();
+    syncAtmosphere();
+    updateChrome();
+    if (state.activeTab === "resumo") {
+      renderResumo();
+    } else if (state.activeTab === "itens") {
+      renderItens();
+    }
+  },
+});
+
+function isMutating(): boolean {
+  return state.trashing || state.deletingSnapshots || devPanel.isBusy();
+}
+
+function isScanningAny(): boolean {
+  return state.scanning || devPanel.isScanning();
+}
 
 let toastTimer: number | undefined;
 
@@ -195,7 +259,42 @@ function syncAtmosphere(): void {
   document.body.dataset.health = health;
 }
 
+const tabScrollTop: Record<TabId, number> = {
+  resumo: 0,
+  itens: 0,
+  dev: 0,
+  ajustes: 0,
+};
+
+function getTabScrollContainer(tab: TabId): HTMLElement | null {
+  if (tab === "resumo") {
+    return panelResumo;
+  }
+  if (tab === "itens") {
+    return panelItens.querySelector<HTMLElement>(".items-list");
+  }
+  if (tab === "dev") {
+    return panelDev.querySelector<HTMLElement>(".dev-body");
+  }
+  return panelAjustes;
+}
+
+function saveTabScroll(tab: TabId): void {
+  const scroller = getTabScrollContainer(tab);
+  if (scroller) {
+    tabScrollTop[tab] = scroller.scrollTop;
+  }
+}
+
+function restoreTabScroll(tab: TabId): void {
+  const scroller = getTabScrollContainer(tab);
+  if (scroller) {
+    scroller.scrollTop = tabScrollTop[tab];
+  }
+}
+
 function setActiveTab(tab: TabId): void {
+  saveTabScroll(state.activeTab);
   state.activeTab = tab;
   for (const btn of tabButtons) {
     const isMatch = btn.dataset.tab === tab;
@@ -204,11 +303,21 @@ function setActiveTab(tab: TabId): void {
   }
   panelResumo.hidden = tab !== "resumo";
   panelItens.hidden = tab !== "itens";
+  panelDev.hidden = tab !== "dev";
   panelAjustes.hidden = tab !== "ajustes";
-  if (tab === "ajustes" && !state.trashing && !state.deletingSnapshots) {
+  if (state.pendingConfirm && state.pendingConfirm.originTab !== tab && !isMutating()) {
     state.pendingConfirm = null;
   }
+  if (tab === "dev") {
+    syncAtmosphere();
+    updateChrome();
+    updateConfirmBar();
+    devPanel.activate();
+    restoreTabScroll("dev");
+    return;
+  }
   renderActiveTab();
+  restoreTabScroll(tab);
 }
 
 function updateChrome(): void {
@@ -221,7 +330,7 @@ function updateChrome(): void {
   }
 
   versionTag.textContent = `v${state.appVersion}`;
-  rescanIconBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+  rescanIconBtn.disabled = isScanningAny() || isMutating();
   rescanIconBtn.classList.toggle("is-spinning", state.scanning);
   rescanIconBtn.setAttribute("aria-label", copy.header.rescanAria);
   rescanIconBtn.title = copy.summary.scanDisk;
@@ -257,19 +366,22 @@ function updateChrome(): void {
     updateHeaderBtn.title = copy.header.checkUpdateTitle;
   }
 
-  tabResumoBtn.replaceChildren(icon(HardDrive, 13), el("span", undefined, copy.tabs.resumo));
+  tabResumoBtn.replaceChildren(icon(HardDrive, 12), el("span", undefined, copy.tabs.resumo));
 
   const count = state.summary?.items.length ?? 0;
-  const countBadge = el("span", "tab-count", formatInt(count, state.language));
+  const countLabel = count > 99 ? "99+" : formatInt(count, state.language);
+  const countBadge = el("span", "tab-count", countLabel);
   countBadge.hidden = count === 0;
   tabItensBtn.replaceChildren(
-    icon(FolderSearch, 13),
+    icon(FolderSearch, 12),
     el("span", undefined, copy.tabs.itens),
     countBadge,
   );
 
+  tabDevBtn.replaceChildren(icon(Code2, 12), el("span", undefined, copy.tabs.dev));
+
   tabAjustesBtn.replaceChildren(
-    icon(SlidersHorizontal, 13),
+    icon(SlidersHorizontal, 12),
     el("span", undefined, copy.tabs.ajustes),
   );
 }
@@ -280,27 +392,47 @@ function updateConfirmBar(): void {
 
   if (!state.pendingConfirm) {
     confirmBar.hidden = true;
+    confirmBar.classList.remove("is-permanent");
+    confirmPermanentBadge.hidden = true;
+    document.documentElement.style.removeProperty("--toast-bottom");
     confirmAcceptBtn.disabled = false;
     confirmCancelBtn.disabled = false;
     confirmAcceptBtn.replaceChildren(icon(Trash2, 12), document.createTextNode(copy.items.moveToTrash));
     return;
   }
 
-  const isSnapshot = state.pendingConfirm.kind === "snapshot";
-  const inProgress = isSnapshot ? state.deletingSnapshots : state.trashing;
-  const actionLabel = isSnapshot
-    ? inProgress
-      ? copy.snapshots.removing
-      : copy.snapshots.confirmAction
-    : inProgress
-      ? copy.items.moving
-      : copy.items.moveToTrash;
+  const pending = state.pendingConfirm;
+  const busy = isMutating();
+  let actionLabel: string;
+  if (pending.kind === "snapshot") {
+    actionLabel = state.deletingSnapshots ? copy.snapshots.removing : copy.snapshots.confirmAction;
+  } else if (pending.kind === "dev") {
+    actionLabel = pending.getActionLabel(devPanel.isBusy());
+  } else {
+    actionLabel = state.trashing ? copy.items.moving : copy.items.moveToTrash;
+  }
 
-  confirmMessage.textContent = state.pendingConfirm.getLabel();
-  confirmAcceptBtn.disabled = state.trashing || state.deletingSnapshots || state.scanning;
-  confirmCancelBtn.disabled = state.trashing || state.deletingSnapshots;
-  confirmAcceptBtn.replaceChildren(icon(Trash2, 12), document.createTextNode(actionLabel));
+  confirmBar.classList.toggle("is-permanent", pending.isPermanent);
+  if (pending.isPermanent) {
+    confirmPermanentBadge.replaceChildren(
+      icon(AlertTriangle, 11),
+      document.createTextNode(copy.confirm.permanentWarning),
+    );
+    confirmPermanentBadge.hidden = false;
+  } else {
+    confirmPermanentBadge.hidden = true;
+  }
+
+  confirmMessage.textContent = pending.getLabel();
+  confirmAcceptBtn.disabled = busy || isScanningAny();
+  confirmCancelBtn.disabled = busy;
+  confirmAcceptBtn.replaceChildren(
+    icon(pending.isPermanent ? AlertTriangle : Trash2, 12),
+    document.createTextNode(actionLabel),
+  );
   confirmBar.hidden = false;
+  const offset = confirmBar.offsetHeight > 0 ? confirmBar.offsetHeight + 20 : 92;
+  document.documentElement.style.setProperty("--toast-bottom", `${offset}px`);
 }
 
 function renderActiveTab(): void {
@@ -311,12 +443,15 @@ function renderActiveTab(): void {
     renderResumo();
   } else if (state.activeTab === "itens") {
     renderItens();
+  } else if (state.activeTab === "dev") {
+    devPanel.render();
   } else {
     renderAjustes();
   }
 }
 
 function renderResumo(): void {
+  const prevScroll = panelResumo.scrollTop;
   const copy = getCopy(state.language);
   panelResumo.replaceChildren();
 
@@ -413,11 +548,12 @@ function renderResumo(): void {
         ? copy.summary.foldersAnalyzed(formatInt(state.summary.itemCount, state.language))
         : copy.summary.idleHint,
   );
+  scanDesc.id = "scan-progress-desc";
 
   const actionRow = el("div", "action-row");
   const scanBtn = el("button", "btn btn-primary");
   scanBtn.type = "button";
-  scanBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+  scanBtn.disabled = isScanningAny() || isMutating();
   scanBtn.append(
     icon(ScanSearch, 14),
     document.createTextNode(
@@ -437,7 +573,7 @@ function renderResumo(): void {
   if (safeTargets.paths.length > 0 && !state.scanning) {
     const cleanSafeBtn = el("button", "btn btn-secondary tabular");
     cleanSafeBtn.type = "button";
-    cleanSafeBtn.disabled = state.trashing || state.deletingSnapshots;
+    cleanSafeBtn.disabled = isMutating() || isScanningAny();
     cleanSafeBtn.append(
       icon(Trash2, 13),
       document.createTextNode(copy.summary.cleanSafeCount(safeTargets.paths.length)),
@@ -490,6 +626,7 @@ function renderResumo(): void {
     villainsSection.append(villainsHead, list);
     panelResumo.append(villainsSection);
   }
+  panelResumo.scrollTop = prevScroll;
 }
 
 function buildSnapshotsSection(): HTMLElement {
@@ -576,11 +713,13 @@ function buildSnapshotsSection(): HTMLElement {
 
     const delBtn = el("button", "btn btn-ghost btn-xs");
     delBtn.type = "button";
-    delBtn.disabled = state.deletingSnapshots || state.trashing || state.scanning;
+    delBtn.disabled = isMutating() || isScanningAny();
     delBtn.append(icon(Trash2, 11), document.createTextNode(copy.snapshots.remove));
     delBtn.addEventListener("click", () => {
       state.pendingConfirm = {
         kind: "snapshot",
+        originTab: "resumo",
+        isPermanent: true,
         dateTokens: [snap.dateToken],
         getLabel: () =>
           getCopy(state.language).snapshots.confirmSingle(
@@ -600,12 +739,14 @@ function buildSnapshotsSection(): HTMLElement {
     const footerRow = el("div", "snapshot-footer");
     const clearAllBtn = el("button", "btn btn-secondary btn-xs");
     clearAllBtn.type = "button";
-    clearAllBtn.disabled = state.deletingSnapshots || state.trashing || state.scanning;
+    clearAllBtn.disabled = isMutating() || isScanningAny();
     clearAllBtn.append(icon(Trash2, 11), document.createTextNode(copy.snapshots.clearAll));
     clearAllBtn.addEventListener("click", () => {
       const tokens = state.snapshots.map((snap) => snap.dateToken);
       state.pendingConfirm = {
         kind: "snapshot",
+        originTab: "resumo",
+        isPermanent: true,
         dateTokens: tokens,
         getLabel: () => getCopy(state.language).snapshots.confirmAll(tokens.length),
       };
@@ -619,6 +760,7 @@ function buildSnapshotsSection(): HTMLElement {
 }
 
 function renderItens(): void {
+  const prevScroll = panelItens.querySelector(".items-list")?.scrollTop ?? 0;
   const copy = getCopy(state.language);
   panelItens.replaceChildren();
 
@@ -631,7 +773,7 @@ function renderItens(): void {
     );
     const btn = el("button", "btn btn-primary");
     btn.type = "button";
-    btn.disabled = state.scanning;
+    btn.disabled = isScanningAny() || isMutating();
     btn.append(
       icon(ScanSearch, 14),
       document.createTextNode(state.scanning ? copy.summary.scanning : copy.summary.scanDisk),
@@ -655,8 +797,10 @@ function renderItens(): void {
 
   for (const filter of filters) {
     const pill = el("button", "filter-pill", filter.label);
+    const active = state.riskFilter === filter.id;
     pill.type = "button";
-    pill.classList.toggle("is-active", state.riskFilter === filter.id);
+    pill.classList.toggle("is-active", active);
+    pill.setAttribute("aria-pressed", active ? "true" : "false");
     pill.addEventListener("click", () => {
       state.riskFilter = filter.id;
       renderItens();
@@ -670,7 +814,7 @@ function renderItens(): void {
   if (safeTargets.paths.length > 0) {
     const cleanAllBtn = el("button", "btn btn-secondary btn-xs");
     cleanAllBtn.type = "button";
-    cleanAllBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+    cleanAllBtn.disabled = isScanningAny() || isMutating();
     cleanAllBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.cleanSafe));
     cleanAllBtn.addEventListener("click", () => {
       requestCleanSafeTargets();
@@ -694,6 +838,7 @@ function renderItens(): void {
     return;
   }
 
+  const maxItemBytes = Math.max(1, ...visibleItems.map((item) => item.sizeBytes));
   const list = el("div", "items-list");
   for (const item of visibleItems) {
     const row = el("article", "item-row");
@@ -717,8 +862,9 @@ function renderItens(): void {
       el("span", "item-size", formatBytes(item.sizeBytes, state.language)),
     );
 
+    const dustBar = createDustBar(item.sizeBytes, maxItemBytes, riskToDustVariant(item.risk));
     const reason = el("p", "item-reason", item.reason);
-    row.append(top, reason);
+    row.append(top, dustBar, reason);
 
     if (item.topExtensions.length > 0) {
       const extRow = el("div", "ext-row");
@@ -767,7 +913,7 @@ function renderItens(): void {
 
     const revealBtn = el("button", "btn btn-ghost btn-icon-xs");
     revealBtn.type = "button";
-    revealBtn.disabled = state.trashing || state.deletingSnapshots;
+    revealBtn.disabled = isMutating();
     revealBtn.setAttribute("aria-label", copy.items.revealInFinder);
     revealBtn.title = copy.items.revealInFinder;
     revealBtn.append(icon(FolderOpen, 12));
@@ -778,7 +924,7 @@ function renderItens(): void {
 
     const ignoreBtn = el("button", "btn btn-ghost btn-icon-xs");
     ignoreBtn.type = "button";
-    ignoreBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+    ignoreBtn.disabled = isScanningAny() || isMutating();
     ignoreBtn.setAttribute("aria-label", copy.items.ignoreAlways);
     ignoreBtn.title = copy.items.ignoreAlways;
     ignoreBtn.append(icon(EyeOff, 12));
@@ -788,11 +934,13 @@ function renderItens(): void {
     actions.append(ignoreBtn);
     const trashBtn = el("button", "btn btn-ghost btn-xs");
     trashBtn.type = "button";
-    trashBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+    trashBtn.disabled = isScanningAny() || isMutating();
     trashBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.trash));
     trashBtn.addEventListener("click", () => {
       state.pendingConfirm = {
         kind: "trash",
+        originTab: "itens",
+        isPermanent: false,
         paths: [item.path],
         getLabel: () =>
           getCopy(state.language).items.confirmTrashItem(
@@ -823,6 +971,14 @@ function renderItens(): void {
           el("span", "item-size", formatBytes(sub.sizeBytes, state.language)),
         );
 
+        const subDustBar = createDustBar(
+          sub.sizeBytes,
+          Math.max(1, item.sizeBytes),
+          riskToDustVariant(sub.risk),
+          true,
+          item.sizeBytes,
+        );
+
         const subBottom = el("div", "subitem-bottom");
         subBottom.append(
           el(
@@ -836,7 +992,7 @@ function renderItens(): void {
 
         const subRevealBtn = el("button", "btn btn-ghost btn-icon-xs");
         subRevealBtn.type = "button";
-        subRevealBtn.disabled = state.trashing || state.deletingSnapshots;
+        subRevealBtn.disabled = isMutating();
         subRevealBtn.setAttribute("aria-label", copy.items.revealInFinder);
         subRevealBtn.title = copy.items.revealInFinder;
         subRevealBtn.append(icon(FolderOpen, 11));
@@ -847,11 +1003,13 @@ function renderItens(): void {
 
         const subTrashBtn = el("button", "btn btn-ghost btn-xs");
         subTrashBtn.type = "button";
-        subTrashBtn.disabled = state.scanning || state.trashing || state.deletingSnapshots;
+        subTrashBtn.disabled = isScanningAny() || isMutating();
         subTrashBtn.append(icon(Trash2, 11), document.createTextNode(copy.items.trash));
         subTrashBtn.addEventListener("click", () => {
           state.pendingConfirm = {
             kind: "trash",
+            originTab: "itens",
+            isPermanent: false,
             paths: [sub.path],
             getLabel: () =>
               getCopy(state.language).items.confirmTrashItem(
@@ -865,7 +1023,7 @@ function renderItens(): void {
 
         subBottom.append(subActions);
 
-        subRow.append(subTop, subBottom);
+        subRow.append(subTop, subDustBar, subBottom);
         subPanel.append(subRow);
       }
       row.append(subPanel);
@@ -875,9 +1033,11 @@ function renderItens(): void {
   }
 
   panelItens.append(list);
+  list.scrollTop = prevScroll;
 }
 
 function renderAjustes(): void {
+  const prevScroll = panelAjustes.scrollTop;
   const copy = getCopy(state.language);
   panelAjustes.replaceChildren();
   const cfg = state.aiConfig;
@@ -889,7 +1049,7 @@ function renderAjustes(): void {
   }
 
   if (!state.settingsDraft) {
-    state.settingsDraft = { ...cfg };
+    state.settingsDraft = sanitizeAiConfigForSave(cfg);
   }
   const draft: AiConfig = state.settingsDraft;
 
@@ -1193,6 +1353,7 @@ function renderAjustes(): void {
   actions.append(detectBtn, saveBtn);
   form.append(langSection, systemSection, minSection, allowlistSection, aiSection, actions);
   panelAjustes.append(form);
+  panelAjustes.scrollTop = prevScroll;
 }
 
 function createTextField(params: {
@@ -1256,6 +1417,8 @@ function requestCleanSafeTargets(): void {
   }
   state.pendingConfirm = {
     kind: "trash",
+    originTab: state.activeTab,
+    isPermanent: false,
     paths: safeTargets.paths,
     getLabel: () =>
       getCopy(state.language).items.confirmTrashSafe(
@@ -1292,6 +1455,7 @@ async function refreshSnapshots(silent: boolean): Promise<void> {
     if (result.snapshots.length === 0) {
       state.snapshotsExpanded = false;
     }
+    invalidateStaleSnapshotConfirm();
   } catch (err) {
     state.snapshotsLoaded = true;
     if (!silent) {
@@ -1306,7 +1470,7 @@ async function refreshSnapshots(silent: boolean): Promise<void> {
 }
 
 async function executeDeleteSnapshots(dateTokens: string[]): Promise<void> {
-  if (state.deletingSnapshots || state.trashing || state.scanning || dateTokens.length === 0) {
+  if (isMutating() || isScanningAny() || dateTokens.length === 0) {
     state.pendingConfirm = null;
     updateConfirmBar();
     return;
@@ -1347,7 +1511,7 @@ async function refreshDiskHealth(): Promise<void> {
 }
 
 async function runScan(): Promise<void> {
-  if (state.scanning || state.trashing || state.deletingSnapshots) {
+  if (isScanningAny() || isMutating()) {
     return;
   }
   const copy = getCopy(state.language);
@@ -1363,7 +1527,10 @@ async function runScan(): Promise<void> {
         ? msg.data.currentPath
         : getCopy(state.language).summary.scanningPath(msg.data.currentPath);
       if (state.activeTab === "resumo") {
-        renderResumo();
+        const descEl = document.getElementById("scan-progress-desc");
+        if (descEl) {
+          descEl.textContent = state.scanProgressText;
+        }
       }
     }
   };
@@ -1423,8 +1590,163 @@ function recomputeItemCleanableBytes(item: ScanItem): number {
     .reduce((sum, sub) => sum + sub.sizeBytes, 0);
 }
 
+function normalizeMacPath(rawPath: string): string {
+  return rawPath.replace(/\/+$/, "").toLowerCase();
+}
+
+function sanitizeAiConfigForSave(cfg: AiConfig): AiConfig {
+  const { devProjectRoots: _roots, devRootsInitialized: _init, ...clean } = cfg;
+  return clean;
+}
+
+function invalidateStaleSnapshotConfirm(): void {
+  if (state.pendingConfirm?.kind !== "snapshot" || isMutating()) {
+    return;
+  }
+  const present = new Set(state.snapshots.map((snap) => snap.dateToken));
+  if (state.pendingConfirm.dateTokens.some((token) => !present.has(token))) {
+    state.pendingConfirm = null;
+    updateConfirmBar();
+  }
+}
+
+function isRemovedOrCovered(candidateNorm: string, removedNorms: string[]): boolean {
+  for (const removed of removedNorms) {
+    if (candidateNorm === removed || candidateNorm.startsWith(`${removed}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function reconcileSummaryAfterTrash(
+  trashedPaths: string[],
+  cleanedItems?: CleanedPathItem[],
+): void {
+  if (!state.summary) {
+    return;
+  }
+  const entryMap = new Map<string, number>();
+  if (cleanedItems) {
+    for (const item of cleanedItems) {
+      const norm = normalizeMacPath(item.path);
+      if (!norm) {
+        continue;
+      }
+      const bytes = Number.isFinite(item.freedBytes) && item.freedBytes > 0 ? item.freedBytes : 0;
+      entryMap.set(norm, (entryMap.get(norm) ?? 0) + bytes);
+    }
+  }
+  for (const rawPath of trashedPaths) {
+    const norm = normalizeMacPath(rawPath);
+    if (norm && !entryMap.has(norm)) {
+      entryMap.set(norm, 0);
+    }
+  }
+  if (entryMap.size === 0) {
+    return;
+  }
+
+  const removedNorms = Array.from(entryMap.keys());
+  const removedEntries = Array.from(entryMap.entries()).map(([norm, freedBytes]) => ({
+    norm,
+    freedBytes,
+  }));
+  const updatedItems: ScanItem[] = [];
+
+  for (const item of state.summary.items) {
+    const itemNorm = normalizeMacPath(item.path);
+    if (isRemovedOrCovered(itemNorm, removedNorms)) {
+      state.expandedItemIds.delete(item.id);
+      if (state.highlightedItemId === item.id) {
+        state.highlightedItemId = null;
+      }
+      continue;
+    }
+
+    const remainingSubs: ScanItem["subitems"] = [];
+    const matchedSubNorms: string[] = [];
+    let removedBytesFromSubs = 0;
+    let removedSubFiles = 0;
+
+    for (const sub of item.subitems) {
+      const subNorm = normalizeMacPath(sub.path);
+      if (isRemovedOrCovered(subNorm, removedNorms)) {
+        removedBytesFromSubs += sub.sizeBytes;
+        removedSubFiles += sub.fileCount;
+        matchedSubNorms.push(subNorm);
+        continue;
+      }
+
+      let childFreed = 0;
+      for (const entry of removedEntries) {
+        if (entry.norm.startsWith(`${subNorm}/`) && entry.freedBytes > 0) {
+          childFreed += entry.freedBytes;
+        }
+      }
+
+      if (childFreed > 0) {
+        matchedSubNorms.push(subNorm);
+        const nextSubSize = Math.max(0, sub.sizeBytes - childFreed);
+        removedBytesFromSubs += sub.sizeBytes - nextSubSize;
+        if (nextSubSize === 0) {
+          removedSubFiles += sub.fileCount;
+          continue;
+        }
+        remainingSubs.push({
+          ...sub,
+          sizeBytes: nextSubSize,
+        });
+      } else {
+        remainingSubs.push(sub);
+      }
+    }
+
+    let unmatchedChildFreed = 0;
+    for (const entry of removedEntries) {
+      if (
+        entry.norm.startsWith(`${itemNorm}/`) &&
+        entry.freedBytes > 0 &&
+        !isRemovedOrCovered(entry.norm, matchedSubNorms)
+      ) {
+        unmatchedChildFreed += entry.freedBytes;
+      }
+    }
+
+    const totalRemovedBytes = removedBytesFromSubs + unmatchedChildFreed;
+    const nextSize = Math.max(0, item.sizeBytes - totalRemovedBytes);
+    if (nextSize === 0 && remainingSubs.length === 0 && totalRemovedBytes > 0) {
+      state.expandedItemIds.delete(item.id);
+      if (state.highlightedItemId === item.id) {
+        state.highlightedItemId = null;
+      }
+      continue;
+    }
+
+    const nextItem: ScanItem = {
+      ...item,
+      sizeBytes: nextSize,
+      fileCount: Math.max(0, item.fileCount - removedSubFiles),
+      subitems: remainingSubs,
+      cleanableBytes: 0,
+    };
+    nextItem.cleanableBytes = recomputeItemCleanableBytes(nextItem);
+    updatedItems.push(nextItem);
+  }
+
+  updatedItems.sort((a, b) => b.sizeBytes - a.sizeBytes || a.name.localeCompare(b.name));
+
+  state.summary = {
+    ...state.summary,
+    items: updatedItems,
+    itemCount: updatedItems.length,
+    totalBytes: updatedItems.reduce((sum, item) => sum + item.sizeBytes, 0),
+    safeBytes: updatedItems.reduce((sum, item) => sum + item.cleanableBytes, 0),
+  };
+}
+
 async function executeTrash(paths: string[]): Promise<void> {
-  if (state.trashing || state.deletingSnapshots || state.scanning || paths.length === 0) {
+  if (isMutating() || isScanningAny() || paths.length === 0) {
     state.pendingConfirm = null;
     updateConfirmBar();
     return;
@@ -1435,58 +1757,7 @@ async function executeTrash(paths: string[]): Promise<void> {
 
   try {
     const result = await invoke<TrashResult>("trash_items", { paths });
-    if (state.summary && result.trashedPaths.length > 0) {
-      const removed = new Set(result.trashedPaths);
-      const updatedItems: ScanItem[] = [];
-
-      for (const item of state.summary.items) {
-        if (removed.has(item.path)) {
-          state.expandedItemIds.delete(item.id);
-          if (state.highlightedItemId === item.id) {
-            state.highlightedItemId = null;
-          }
-          continue;
-        }
-        const remainingSubs = item.subitems.filter((sub) => !removed.has(sub.path));
-        const removedSubBytes = item.subitems
-          .filter((sub) => removed.has(sub.path))
-          .reduce((sum, sub) => sum + sub.sizeBytes, 0);
-        const removedSubFiles = item.subitems
-          .filter((sub) => removed.has(sub.path))
-          .reduce((sum, sub) => sum + sub.fileCount, 0);
-
-        const nextSize = Math.max(0, item.sizeBytes - removedSubBytes);
-        if (nextSize === 0 && remainingSubs.length === 0 && removedSubBytes > 0) {
-          state.expandedItemIds.delete(item.id);
-          if (state.highlightedItemId === item.id) {
-            state.highlightedItemId = null;
-          }
-          continue;
-        }
-
-        const nextItem: ScanItem = {
-          ...item,
-          sizeBytes: nextSize,
-          fileCount: Math.max(0, item.fileCount - removedSubFiles),
-          subitems: remainingSubs,
-          cleanableBytes: 0,
-        };
-        nextItem.cleanableBytes = recomputeItemCleanableBytes(nextItem);
-        updatedItems.push(nextItem);
-      }
-
-      updatedItems.sort(
-        (a, b) => b.sizeBytes - a.sizeBytes || a.name.localeCompare(b.name),
-      );
-
-      state.summary = {
-        ...state.summary,
-        items: updatedItems,
-        itemCount: updatedItems.length,
-        totalBytes: updatedItems.reduce((sum, item) => sum + item.sizeBytes, 0),
-        safeBytes: updatedItems.reduce((sum, item) => sum + item.cleanableBytes, 0),
-      };
-    }
+    reconcileSummaryAfterTrash(result.trashedPaths);
 
     await refreshDiskHealth();
 
@@ -1580,7 +1851,7 @@ async function saveLanguagePreference(language: AppLanguage): Promise<void> {
   }
   try {
     const saved = await invoke<AiConfig>("set_ai_config", {
-      config: { ...state.aiConfig, language },
+      config: sanitizeAiConfigForSave({ ...state.aiConfig, language }),
     });
     state.aiConfig = saved;
     state.language = saved.language;
@@ -1599,7 +1870,7 @@ async function saveLowDiskAlertPreference(enabled: boolean): Promise<void> {
   }
   try {
     const saved = await invoke<AiConfig>("set_ai_config", {
-      config: { ...state.aiConfig, lowDiskAlertEnabled: enabled },
+      config: sanitizeAiConfigForSave({ ...state.aiConfig, lowDiskAlertEnabled: enabled }),
     });
     state.aiConfig = saved;
     if (state.settingsDraft) {
@@ -1657,6 +1928,21 @@ async function ignorePath(path: string, displayName: string): Promise<void> {
         safeBytes: remaining.reduce((sum, item) => sum + item.cleanableBytes, 0),
       };
     }
+    if (state.pendingConfirm?.kind === "trash" && !isMutating()) {
+      const ignoredNorm = normalizeMacPath(path);
+      const referencesIgnored = state.pendingConfirm.paths.some((p) => {
+        const pNorm = normalizeMacPath(p);
+        return (
+          pNorm === ignoredNorm ||
+          pNorm.startsWith(`${ignoredNorm}/`) ||
+          ignoredNorm.startsWith(`${pNorm}/`)
+        );
+      });
+      if (referencesIgnored) {
+        state.pendingConfirm = null;
+        updateConfirmBar();
+      }
+    }
     showToast(getCopy(state.language).toasts.pathIgnored(displayName));
     renderActiveTab();
   } catch (err) {
@@ -1680,15 +1966,16 @@ async function unignorePath(path: string): Promise<void> {
 }
 
 async function saveSettings(draft: AiConfig): Promise<void> {
+  const cleanDraft = sanitizeAiConfigForSave(draft);
   state.savingSettings = true;
   state.settingsError = null;
-  state.settingsDraft = { ...draft };
+  state.settingsDraft = { ...cleanDraft };
   renderAjustes();
 
   try {
-    const saved = await invoke<AiConfig>("set_ai_config", { config: draft });
+    const saved = await invoke<AiConfig>("set_ai_config", { config: cleanDraft });
     state.aiConfig = saved;
-    state.settingsDraft = { ...saved };
+    state.settingsDraft = sanitizeAiConfigForSave(saved);
     state.language = saved.language;
     showToast(getCopy(state.language).toasts.settingsSaved);
   } catch (err) {
@@ -1700,23 +1987,24 @@ async function saveSettings(draft: AiConfig): Promise<void> {
 }
 
 async function detectOllamaModels(draft: AiConfig): Promise<void> {
+  const cleanDraft = sanitizeAiConfigForSave(draft);
   state.detectingModels = true;
   state.settingsError = null;
-  state.settingsDraft = { ...draft };
+  state.settingsDraft = { ...cleanDraft };
   renderAjustes();
 
   try {
-    const saved = await invoke<AiConfig>("set_ai_config", { config: draft });
+    const saved = await invoke<AiConfig>("set_ai_config", { config: cleanDraft });
     state.aiConfig = saved;
-    state.settingsDraft = { ...saved };
+    state.settingsDraft = sanitizeAiConfigForSave(saved);
     const models = await invoke<string[]>("list_ollama_models");
     state.installedOllamaModels = models;
     if (models.length > 0 && (!saved.ollamaModel || !models.includes(saved.ollamaModel))) {
       const updated = await invoke<AiConfig>("set_ai_config", {
-        config: { ...saved, ollamaModel: models[0] },
+        config: sanitizeAiConfigForSave({ ...saved, ollamaModel: models[0] }),
       });
       state.aiConfig = updated;
-      state.settingsDraft = { ...updated };
+      state.settingsDraft = sanitizeAiConfigForSave(updated);
     }
     const copy = getCopy(state.language);
     showToast(
@@ -1776,23 +2064,31 @@ function wireEvents(): void {
   });
 
   confirmAcceptBtn.addEventListener("click", () => {
-    if (!state.pendingConfirm) {
+    const pending = state.pendingConfirm;
+    if (!pending) {
       return;
     }
-    if (state.pendingConfirm.kind === "trash") {
-      void executeTrash(state.pendingConfirm.paths);
+    if (pending.kind === "trash") {
+      void executeTrash(pending.paths);
+    } else if (pending.kind === "snapshot") {
+      void executeDeleteSnapshots(pending.dateTokens);
     } else {
-      void executeDeleteSnapshots(state.pendingConfirm.dateTokens);
+      void (async () => {
+        try {
+          await pending.onConfirm();
+        } finally {
+          if (state.pendingConfirm === pending) {
+            state.pendingConfirm = null;
+          }
+          updateChrome();
+          updateConfirmBar();
+        }
+      })();
     }
   });
 
   window.addEventListener("keydown", (event) => {
-    if (
-      event.key === "Escape" &&
-      state.pendingConfirm &&
-      !state.trashing &&
-      !state.deletingSnapshots
-    ) {
+    if (event.key === "Escape" && state.pendingConfirm && !isMutating()) {
       state.pendingConfirm = null;
       updateConfirmBar();
     }

@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
 
 use crate::rules::{
-    classify_subpath, normalize_path, path_starts_with_platform, paths_equal_platform, RiskLevel,
-    RuleEngine,
+    classify_subpath, has_unsafe_raw_path_syntax, normalize_path, path_starts_with_platform,
+    paths_equal_platform, RiskLevel, RuleEngine,
 };
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -558,29 +558,29 @@ pub(crate) fn summarize_scan(
     }
 }
 
-fn is_within_cleanable_scope(engine: &RuleEngine, candidate: &Path) -> bool {
-    let resolved = fs::canonicalize(candidate).unwrap_or_else(|_| normalize_path(candidate));
-    let home =
-        fs::canonicalize(engine.home_dir()).unwrap_or_else(|_| normalize_path(engine.home_dir()));
+fn is_within_cleanable_scope(engine: &RuleEngine, canonical_target: &Path) -> bool {
+    let Ok(canonical_home) = fs::canonicalize(engine.home_dir()) else {
+        return false;
+    };
 
-    if !path_starts_with_platform(&resolved, &home) || paths_equal_platform(&resolved, &home) {
+    if !path_starts_with_platform(canonical_target, &canonical_home)
+        || paths_equal_platform(canonical_target, &canonical_home)
+    {
         return false;
     }
 
-    let roots = default_scan_roots(&home);
-    for root in &roots {
-        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        if path_starts_with_platform(&resolved, &canonical_root)
-            && !paths_equal_platform(&resolved, &canonical_root)
+    for suffix in SCAN_ROOT_SUFFIXES {
+        let allowed_root = normalize_path(&canonical_home.join(suffix));
+        if path_starts_with_platform(canonical_target, &allowed_root)
+            && !paths_equal_platform(canonical_target, &allowed_root)
         {
             return true;
         }
     }
 
-    let direct_targets = default_direct_targets(&home);
-    for target in &direct_targets {
-        let canonical_target = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
-        if path_starts_with_platform(&resolved, &canonical_target) {
+    for suffix in DIRECT_TARGET_SUFFIXES {
+        let allowed_target = normalize_path(&canonical_home.join(suffix));
+        if path_starts_with_platform(canonical_target, &allowed_target) {
             return true;
         }
     }
@@ -593,20 +593,27 @@ pub(crate) fn validate_cleanable_target(
     raw_path: &str,
 ) -> Result<PathBuf, &'static str> {
     let candidate = Path::new(raw_path);
-    if !candidate.is_absolute() || engine.is_protected_or_ancestor(candidate) {
+    if !candidate.is_absolute() || has_unsafe_raw_path_syntax(candidate) {
         return Err("Caminho protegido pela política do sistema.");
     }
 
-    let meta = fs::symlink_metadata(candidate).map_err(|_| "Item não encontrado no disco.")?;
+    let normalized = normalize_path(candidate);
+    if engine.is_protected_or_ancestor(&normalized) {
+        return Err("Caminho protegido pela política do sistema.");
+    }
+
+    let meta = fs::symlink_metadata(&normalized).map_err(|_| "Item não encontrado no disco.")?;
     if meta.file_type().is_symlink() {
         return Err("Caminho protegido pela política do sistema.");
     }
 
-    if !is_within_cleanable_scope(engine, candidate) {
+    let canonical = fs::canonicalize(&normalized).map_err(|_| "Item não encontrado no disco.")?;
+    if engine.is_protected_or_ancestor(&canonical) || !is_within_cleanable_scope(engine, &canonical)
+    {
         return Err("Caminho protegido pela política do sistema.");
     }
 
-    fs::canonicalize(candidate).map_err(|_| "Item não encontrado no disco.")
+    Ok(canonical)
 }
 
 pub(crate) fn move_items_to_trash(
@@ -624,29 +631,44 @@ pub(crate) fn move_items_to_trash(
         .collect();
     normalized_inputs.sort_by_key(|(_, p)| p.components().count());
 
-    let mut accepted_paths: Vec<PathBuf> = Vec::new();
+    let mut accepted_normalized: Vec<PathBuf> = Vec::new();
+    let mut accepted_canonical: Vec<PathBuf> = Vec::new();
 
     for (raw_path, normalized) in normalized_inputs {
-        if let Err(reason) = validate_cleanable_target(engine, &raw_path) {
-            failed_paths.push(TrashFailure {
-                path: raw_path,
-                reason: reason.to_string(),
-            });
-            continue;
-        }
-
-        if accepted_paths
-            .iter()
-            .any(|parent| path_starts_with_platform(&normalized, parent))
+        let raw_candidate = Path::new(&raw_path);
+        if raw_candidate.is_absolute()
+            && !has_unsafe_raw_path_syntax(raw_candidate)
+            && accepted_normalized
+                .iter()
+                .any(|parent| path_starts_with_platform(&normalized, parent))
         {
             continue;
         }
 
-        match trash::delete(Path::new(&raw_path)) {
+        let canonical_path = match validate_cleanable_target(engine, &raw_path) {
+            Ok(path) => path,
+            Err(reason) => {
+                failed_paths.push(TrashFailure {
+                    path: raw_path,
+                    reason: reason.to_string(),
+                });
+                continue;
+            }
+        };
+
+        if accepted_canonical
+            .iter()
+            .any(|parent| path_starts_with_platform(&canonical_path, parent))
+        {
+            continue;
+        }
+
+        match trash::delete(&canonical_path) {
             Ok(()) => {
                 freed_bytes =
                     freed_bytes.saturating_add(known_sizes.get(&raw_path).copied().unwrap_or(0));
-                accepted_paths.push(normalized);
+                accepted_normalized.push(normalized);
+                accepted_canonical.push(canonical_path);
                 trashed_paths.push(raw_path);
             }
             Err(err) => {
@@ -674,7 +696,8 @@ pub(crate) fn sanitize_relative_path(path: &Path, home_dir: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
+#[must_use]
+pub(crate) fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
     use std::os::macos::fs::MetadataExt;
     const SF_DATALESS: u32 = 0x4000_0000;
     const UF_COMPRESSED: u32 = 0x0000_0020;
@@ -695,7 +718,8 @@ fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
+#[must_use]
+pub(crate) fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     const SMALL_INLINE_THRESHOLD: u64 = 64 * 1024;
     let apparent = meta.len();
@@ -710,8 +734,46 @@ fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
+#[must_use]
+pub(crate) fn effective_file_size(meta: &std::fs::Metadata) -> u64 {
     meta.len()
+}
+
+#[must_use]
+pub(crate) fn dir_disk_size(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if meta.file_type().is_file() {
+        return effective_file_size(&meta);
+    }
+    if !meta.file_type().is_dir() {
+        return 0;
+    }
+
+    let mut total = 0_u64;
+    for entry_result in WalkDir::new(path).skip_hidden(false).follow_links(false) {
+        let Ok(entry) = entry_result else {
+            continue;
+        };
+        if entry.file_type().is_symlink() || !entry.file_type().is_file() {
+            continue;
+        }
+        match entry.metadata() {
+            Ok(entry_meta) => {
+                total = total.saturating_add(effective_file_size(&entry_meta));
+            }
+            Err(err)
+                if err
+                    .io_error()
+                    .is_some_and(|io_err| is_ignorable_io_error(io_err.kind())) => {}
+            Err(_) => {}
+        }
+    }
+    total
 }
 
 fn scan_single_root(
@@ -1153,7 +1215,8 @@ fn format_human_bytes(bytes: u64) -> String {
     }
 }
 
-fn days_since(latest_modified: Option<SystemTime>, now: SystemTime) -> u64 {
+#[must_use]
+pub(crate) fn days_since(latest_modified: Option<SystemTime>, now: SystemTime) -> u64 {
     latest_modified
         .and_then(|mtime| now.duration_since(mtime).ok())
         .map_or(0, |duration| duration.as_secs() / SECONDS_PER_DAY)
@@ -1172,7 +1235,8 @@ fn infer_category(path: &Path) -> String {
     }
 }
 
-fn is_ignorable_io_error(kind: ErrorKind) -> bool {
+#[must_use]
+pub(crate) fn is_ignorable_io_error(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::PermissionDenied | ErrorKind::NotFound)
 }
 
@@ -1479,5 +1543,58 @@ mod tests {
 
         assert_eq!(output.items.len(), 1);
         assert_eq!(output.items[0].rule_id.as_deref(), Some("homebrew"));
+    }
+
+    #[test]
+    fn dir_disk_size_measures_files_dirs_and_skips_symlinks() {
+        let root = unique_temp_dir("dir_disk_size");
+        let nested = root.join("sub/.hidden");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let file_a = root.join("a.bin");
+        let file_b = nested.join("b.bin");
+        fs::write(&file_a, vec![1_u8; 4096]).expect("write a");
+        fs::write(&file_b, vec![2_u8; 8192]).expect("write b");
+
+        let link_file = root.join("link.bin");
+        std::os::unix::fs::symlink(&file_a, &link_file).expect("symlink file");
+
+        assert_eq!(dir_disk_size(&file_a), 4096);
+        assert_eq!(dir_disk_size(&link_file), 0);
+        assert_eq!(dir_disk_size(&root), 4096 + 8192);
+        assert_eq!(dir_disk_size(&root.join("missing")), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_cleanable_target_rejects_trailing_slash_symlink_and_symlinked_root() {
+        let root = unique_temp_dir("symlink_hardening");
+        let real_target = root.join("Desktop/secret_dir");
+        let secret_child = real_target.join("nested");
+        fs::create_dir_all(&secret_child).expect("create secret dir");
+        fs::create_dir_all(root.join("Library")).expect("create Library");
+
+        let caches_link = root.join("Library/Caches");
+        std::os::unix::fs::symlink(&real_target, &caches_link).expect("symlink Caches");
+
+        let app_support = root.join("Library/Application Support");
+        fs::create_dir_all(&app_support).expect("create app support");
+        let dir_link = app_support.join("link_dir");
+        std::os::unix::fs::symlink(&real_target, &dir_link).expect("symlink dir");
+
+        let engine =
+            RuleEngine::from_toml_str(include_str!("../rules/known.toml"), &root).expect("parse");
+
+        let trailing_slash_link = format!("{}/", dir_link.to_string_lossy());
+        assert!(validate_cleanable_target(&engine, &trailing_slash_link).is_err());
+
+        let via_symlinked_root = caches_link.join("nested").to_string_lossy().into_owned();
+        assert!(validate_cleanable_target(&engine, &via_symlinked_root).is_err());
+
+        let parent_dir_traversal = format!("{}/../Desktop", app_support.to_string_lossy());
+        assert!(validate_cleanable_target(&engine, &parent_dir_traversal).is_err());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

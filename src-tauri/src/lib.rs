@@ -1,10 +1,16 @@
 mod ai;
+mod cli;
 mod commands;
+mod containers;
+mod dev_commands;
+mod dev_projects;
 mod rules;
 mod scanner;
 mod snapshots;
+mod toolchains;
+mod xcode;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -18,7 +24,7 @@ use tauri_plugin_positioner::{Position, WindowExt};
 use crate::ai::AppLanguage;
 use crate::scanner::{read_disk_health, DiskHealth};
 
-const MAIN_WINDOW_LABEL: &str = "main";
+pub(crate) const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ID: &str = "macleaner-tray";
 const QUIT_MENU_ID: &str = "quit";
 const FOCUS_HIDE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -27,8 +33,9 @@ const LOW_DISK_TRIGGER_PERCENT: u64 = 15;
 const LOW_DISK_RESET_PERCENT: u64 = 18;
 
 #[derive(Default)]
-struct PopoverState {
+pub(crate) struct PopoverState {
     last_hidden: Mutex<Option<Instant>>,
+    pub(crate) suppress_hide: AtomicUsize,
 }
 
 #[must_use]
@@ -221,6 +228,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(PopoverState::default())
         .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
@@ -270,6 +278,9 @@ pub fn run() {
             if let WindowEvent::Focused(false) = event {
                 if window.label() == MAIN_WINDOW_LABEL {
                     if let Some(state) = window.try_state::<PopoverState>() {
+                        if state.suppress_hide.load(Ordering::Acquire) > 0 {
+                            return;
+                        }
                         if let Ok(mut guard) = state.last_hidden.lock() {
                             *guard = Some(Instant::now());
                         }
@@ -296,6 +307,21 @@ pub fn run() {
             commands::remove_ignored_path,
             commands::get_autostart_enabled,
             commands::set_autostart_enabled,
+            dev_commands::get_dev_project_roots,
+            dev_commands::pick_dev_root_folder,
+            dev_commands::add_dev_project_root,
+            dev_commands::remove_dev_project_root,
+            dev_commands::scan_dev_projects,
+            dev_commands::trash_dev_project_artifacts,
+            dev_commands::inspect_xcode,
+            dev_commands::trash_xcode_items,
+            dev_commands::delete_unavailable_simulators,
+            dev_commands::delete_simulator_runtime,
+            dev_commands::inspect_docker_containers,
+            dev_commands::prune_docker_scope,
+            dev_commands::inspect_dev_toolchains,
+            dev_commands::trash_dev_toolchain_cache,
+            dev_commands::run_homebrew_clean,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

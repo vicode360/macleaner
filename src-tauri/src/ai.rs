@@ -82,6 +82,10 @@ pub struct AiConfig {
     pub ignored_paths: Vec<String>,
     #[serde(default = "default_low_disk_alert_enabled")]
     pub low_disk_alert_enabled: bool,
+    #[serde(default)]
+    pub dev_project_roots: Vec<String>,
+    #[serde(default)]
+    pub dev_roots_initialized: bool,
 }
 
 fn default_low_disk_alert_enabled() -> bool {
@@ -107,6 +111,8 @@ impl fmt::Debug for AiConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("ignored_paths", &self.ignored_paths)
             .field("low_disk_alert_enabled", &self.low_disk_alert_enabled)
+            .field("dev_project_roots", &self.dev_project_roots)
+            .field("dev_roots_initialized", &self.dev_roots_initialized)
             .finish()
     }
 }
@@ -125,6 +131,8 @@ impl Default for AiConfig {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             ignored_paths: Vec::new(),
             low_disk_alert_enabled: true,
+            dev_project_roots: Vec::new(),
+            dev_roots_initialized: false,
         }
     }
 }
@@ -1136,6 +1144,8 @@ mod tests {
         let parsed: AiConfig = serde_json::from_str(legacy_json).expect("legacy json parses");
         assert!(parsed.ignored_paths.is_empty());
         assert!(parsed.low_disk_alert_enabled);
+        assert!(parsed.dev_project_roots.is_empty());
+        assert!(!parsed.dev_roots_initialized);
 
         let normalized = normalize_ignored_paths(&[
             "  /Users/tester/Library/Caches/Steam/  ".to_string(),

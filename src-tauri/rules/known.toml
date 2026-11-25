@@ -174,9 +174,10 @@ patterns = [
   "Xcode/iOS DeviceSupport",
   "Xcode/watchOS DeviceSupport",
   "Xcode/tvOS DeviceSupport",
+  "Xcode/visionOS DeviceSupport",
 ]
 risk = "baixo"
-reason = "Símbolos de depuração de versões antigas do iOS/watchOS; recriados ao reconectar o aparelho."
+reason = "Símbolos de depuração de versões antigas do iOS/watchOS/tvOS/visionOS; recriados ao reconectar o aparelho."
 selected_by_default = true
 
 [[rule]]
@@ -312,3 +313,12 @@ patterns = [".orbstack"]
 risk = "alto"
 reason = "Máquinas Linux e volumes do OrbStack; revise ou limpe diretamente pelo app OrbStack."
 selected_by_default = false
+
+[[rule]]
+id = "bun-cache"
+name = "Bun Cache"
+category = "developer"
+patterns = [".bun/install/cache"]
+risk = "baixo"
+reason = "Cache local de pacotes instalados pelo Bun; baixados novamente ao instalar dependências."
+selected_by_default = true
